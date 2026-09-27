@@ -160,6 +160,12 @@ void* TP_MAKE_THISCALL(EquipHook, EquipManager, Actor* apActor, TESForm* apItem,
     if (!apActor)
         return nullptr;
 
+    // The engine clears a slot by calling these hooks with a null form, so the
+    // form is never dereferenced unguarded. Reading formID off a null form is an
+    // access violation at offset 0x14, which is a confirmed crash.
+    if (!apItem || !apData)
+        return TiltedPhoques::ThisCall(RealEquip, apThis, apActor, apItem, apData);
+
     const auto pExtension = apActor->GetExtension();
     if (pExtension->IsRemote())
     {
@@ -192,6 +198,9 @@ void* TP_MAKE_THISCALL(UnEquipHook, EquipManager, Actor* apActor, TESForm* apIte
 {
     if (!apActor)
         return nullptr;
+
+    if (!apItem || !apData)
+        return TiltedPhoques::ThisCall(RealUnEquip, apThis, apActor, apItem, apData);
 
     const auto pExtension = apActor->GetExtension();
     if (pExtension->IsRemote())
@@ -226,6 +235,9 @@ void* TP_MAKE_THISCALL(EquipSpellHook, EquipManager, Actor* apActor, TESForm* ap
     if (!apActor)
         return nullptr;
 
+    if (!apSpell || !apData)
+        return TiltedPhoques::ThisCall(RealEquipSpell, apThis, apActor, apSpell, apData);
+
     const auto pExtension = apActor->GetExtension();
     if (pExtension->IsRemote() && !ScopedEquipOverride::IsOverriden())
         return nullptr;
@@ -235,7 +247,7 @@ void* TP_MAKE_THISCALL(EquipSpellHook, EquipManager, Actor* apActor, TESForm* ap
         EquipmentChangeEvent evt{};
         evt.ActorId = apActor->formID;
         evt.ItemId = apSpell->formID;
-        evt.EquipSlotId = apData->pEquipSlot->formID;
+        evt.EquipSlotId = apData->pEquipSlot ? apData->pEquipSlot->formID : 0;
         evt.IsSpell = true;
 
         QueueEquipmentChange(apActor, std::move(evt));
@@ -251,6 +263,11 @@ void* TP_MAKE_THISCALL(UnEquipSpellHook, EquipManager, Actor* apActor, TESForm* 
     if (!apActor)
         return nullptr;
 
+    // Confirmed crash: the engine calls this hook with a null spell when it
+    // clears a hand, and the unconditional apSpell->formID read faulted at 0x14.
+    if (!apSpell || !apData)
+        return TiltedPhoques::ThisCall(RealUnEquipSpell, apThis, apActor, apSpell, apData);
+
     const auto pExtension = apActor->GetExtension();
     if (pExtension->IsRemote() && !ScopedEquipOverride::IsOverriden())
         return nullptr;
@@ -260,7 +277,7 @@ void* TP_MAKE_THISCALL(UnEquipSpellHook, EquipManager, Actor* apActor, TESForm* 
         EquipmentChangeEvent evt{};
         evt.ActorId = apActor->formID;
         evt.ItemId = apSpell->formID;
-        evt.EquipSlotId = apData->pEquipSlot->formID;
+        evt.EquipSlotId = apData->pEquipSlot ? apData->pEquipSlot->formID : 0;
         evt.Unequip = true;
         evt.IsSpell = true;
 
@@ -274,6 +291,9 @@ void* TP_MAKE_THISCALL(EquipShoutHook, EquipManager, Actor* apActor, TESForm* ap
 {
     if (!apActor)
         return nullptr;
+
+    if (!apShout)
+        return TiltedPhoques::ThisCall(RealEquipShout, apThis, apActor, apShout, apData);
 
     const auto pExtension = apActor->GetExtension();
     if (pExtension->IsRemote() && !ScopedEquipOverride::IsOverriden())
@@ -299,6 +319,9 @@ void* TP_MAKE_THISCALL(UnEquipShoutHook, EquipManager, Actor* apActor, TESForm* 
 {
     if (!apActor)
         return nullptr;
+
+    if (!apShout)
+        return TiltedPhoques::ThisCall(RealUnEquipShout, apThis, apActor, apShout, apData);
 
     const auto pExtension = apActor->GetExtension();
     if (pExtension->IsRemote() && !ScopedEquipOverride::IsOverriden())

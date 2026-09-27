@@ -119,6 +119,26 @@ jobs:
         shell: pwsh
         run: python Code/plugins/tools/check_transport_compat.py
 
+      # The plugins reach RaceMenu by name, so a RaceMenu whose interfaces are a
+      # different version is handed back as a pointer with a different vtable
+      # order and every later call dispatches to the wrong method. That is the
+      # skee64.dll+0x81be8 crash: OverlayType::Spell passed where
+      # RevertHeadOverlays wanted a TESObjectREFR*, faulting at [1 + 0x14]. The
+      # declarations are checked against RaceMenu's real order here, and each one
+      # must carry the version it is valid for.
+      #
+      # The declarations that ship are the patched ones, so the patches have to
+      # be on the tree before this reads it - the same apply the build runs. It
+      # comes after the snapshot and patch gates above, which both want the
+      # pristine pinned content.
+      - name: Apply the plugin patches
+        shell: pwsh
+        run: python Code/plugins/tools/plugin_patches.py apply
+
+      - name: Verify the SKEE interface declarations
+        shell: pwsh
+        run: python Code/plugins/tools/check_skee_abi.py
+
       # CODE_GUIDELINES.md makes documentation part of every version change.
       # This is what enforces it: the coverage figures in prose must match the
       # generator, both README version tables must cover every changelog

@@ -7,6 +7,53 @@
 每个 tag(形如 `v1.0.20`)对应一个 Release,附上版本号相同的两个包——
 客户端 mod 与专用服务器。逐条提交的历史见 `git log` 与各次 PR。
 
+## v1.1.6(2026-09-27)
+
+### 修复:两处「刚进游戏就闪退」—— 一处在我们的运行时,一处在 RaceMenu 接口版本
+
+**现象**:MO2 + SKSE 打开游戏「一小会儿就直接闪退」。日志里三种崩溃,其中两种反复出现,
+都是 `EXCEPTION_ACCESS_VIOLATION`,而且两次读到的都是 `0x14`
+(即 `TESForm::formID` 的偏移)附近那个**不可能是地址**的数:
+
+```
+# A（三次）skee64.dll+0x81be8                  mov eax, [r14+0x14]   target 0x15
+# B（一次）  SkyrimTogetherRuntime_1_5.dll+0x16CFA8  mov eax, [r15+0x14]   target 0x14
+```
+
+**A:RaceMenu 的接口按名字取,布局没人核对。** 插件发 `kMessageExchangeInterface` 拿到
+`IInterfaceMap`,再 `QueryInterface("Overlay")` —— 这一步**只按名字查表,不校验布局**。
+实测本机的 `skee64.dll` 里 `.?AVOverlayInterface@@` 的 vtable 是**版本 1**(23 槽),
+而两个插件声明的是**版本 2**:插件以为槽位 `[11]` 是 `GetOverlayCount`,
+DLL 那里其实是 `RevertHeadOverlays`。于是 `GetOverlayCount(Spell, ...)` 把
+`rdx = 1`(枚举值 `OverlayType::Spell`)当成 `TESObjectREFR*` 传进去,
+读 `[1+0x14]` = `0x15` → 闪退。
+
+这也解释了**为什么能进游戏**:四次 `Normal` 调用的 `rdx = 0`,
+而 v1 的 `RevertHeadOverlays` 开头恰好有 `testq %rdx,%rdx; je`,
+所以它们**全部安全返回**;只有 `Spell` 才踩中 —— 正是「玩一小会儿才崩」。
+
+**修法**:两个插件(补丁形式,见 `Code/plugins/patches/`)在采用接口前**先查 `GetVersion()`**,
+版本不足就拒绝该接口并打印明确错误,而不是继续调用。`GetVersion()` 在每种布局里都是槽位 `[1]`,
+是唯一能在调用其它方法之前安全调用的方法。`IBodyMorphInterface` 只追加,所以版本 4 的声明对版本 5 仍有效,
+门禁写成 `>= 4` 而非 `== 5`。
+
+**B:引擎用空指针调用装备钩子来清空槽位。** `Code/client/Games/Skyrim/EquipManager.cpp` 的六个钩子里,
+只有 `apActor` 判了空。法术/龙吼四个直接读 `apSpell->formID` / `apShout->formID`,
+而**引擎清空一只手时就是用空形式调用它们**的 → 读 `[0+0x14]` → 闪退。
+(物品那两个钩子的 `pSlot` 早就写了 `?: 0` 三元写法,说明这个坑当时知道,只是没推广过去。)
+
+**修法**:六个钩子统一判空,且为空时**原样转发给原函数**而不是返回 `nullptr`
+(返回 `nullptr` 会让引擎以为「这次装备被取消」,与清空槽位的行为不符);
+`pEquipSlot` 同样补上 `?: 0`。
+
+### 新增门禁:SKEE 接口声明的顺序与版本
+
+新增 `Code/plugins/tools/check_skee_abi.py`(已接入 `plugins.yml`):
+把两个插件声明的 SKEE 方法**顺序**逐槽与 RaceMenu 的真实顺序比对,并要求每份声明都带
+版本门禁。**反向验证过三种改坏方式**,每一种都会被它抓到:删掉 `RevertOverlay`、
+对调 `GetOverlayCount`/`GetOverlayFormat`、移除版本门禁。
+
+> 详细取证(反汇编、`target address` 的读法、两个布局的逐槽对照)见 `docs/PITFALLS.md` §37。
 ## v1.1.5(2026-09-27)
 
 ### 文档约定:已修的缺陷不再写进 README

@@ -3376,3 +3376,148 @@ KiLoader 不是普通 SKSE 插件，而是一个**插件加载框架**：它有�
 跑在它上面的插件。正因为它是**按进程**存在的框架，同一台机器上出现第二份实例
 时才会撞日志文件 —— 这是它如实报告了被强加的碰撞，不是它的缺陷。
 
+
+## 37. 2026-09-27 场次：两处「刚进游戏就闪退」，一处来自我们的运行时，一处来自 RaceMenu 的版本错配
+
+**报障**：MO2 + SKSE 打开游戏「一小会儿就直接闪退」。日志目录里能读到三种崩溃，
+其中两种各有三次以上复现，全部是 `EXCEPTION_ACCESS_VIOLATION`，
+且**两次都读到了一个明显不是地址的偏移量**：
+
+```
+# A（三次）skee64.dll+0x81be8                  mov eax, [r14+0x14]   target 0x15
+# B（一次）  SkyrimTogetherRuntime_1_5.dll+0x16CFA8  mov eax, [r15+0x14]   target 0x14
+```
+
+两处都是 `0x14` —— 这是 `TESForm::formID` 的偏移。也就是说：
+**代码把一个空指针（或一个根本不是指针的东西）当成 `TESForm*` 去读它的 formID。**
+两次的成因完全不同，必须分开修。
+
+### 37.1 判据：先看「目标地址」是哪个常量，不要先看模块名
+
+崩溃日志里最有信息量的一行不是模块名，而是：
+
+```
+access type read (code 0), target address 0x15 (unmapped 0x15)
+```
+
+`0x15 = 0x14 + 1`，`0x14 = 0x14 + 0`。这两个数字直接说明了**被当成指针的那个值本身**
+是 `1` 和 `0`：
+
+| 崩溃 | 寄存器值 | 被误当成 | 真实含义 |
+| --- | --- | --- | --- |
+| A | `r14 = 1` | `TESObjectREFR*` | `OverlayType::Spell` 枚举值 |
+| B | `r15 = 0` | `TESForm*` | 空指针 |
+
+**教训**：`target address` 落在 `0x14` 附近时，先假设「有人把一个整数/枚举当指针传了」，
+再回去找那个调用点；只看模块名会得出「第三方 DLL 有 bug」的错误结论。
+
+### 37.2 崩溃 A：RaceMenu 的接口是**按名字**取的，布局却没人核对
+
+链路：
+
+1. 插件发 `kMessageExchangeInterface`，拿回 `IInterfaceMap`；
+2. `QueryInterface("Overlay")` —— **只按名字查表，不校验布局**；
+3. 插件用自己那份 `IOverlayInterface` 声明去调用；
+4. 声明与 DLL 的 vtable 顺序不一致 → **调用了隔壁的方法**。
+
+实测这台机器上的 `skee64.dll`（FileVersion 4.0.0.0）里，
+`.?AVOverlayInterface@@` 的 vtable 有 **23** 个槽位，
+槽位 `[11]` 的函数地址是 `0x180081B00`，其中 `0x180081BE8` 正是崩溃点，
+而该函数开头就是 `testq %rdx,%rdx / je`，随后 `mov 0x14(%rdx),%eax`：
+
+```
+180081B00  testq %rdx, %rdx
+180081B03  je    0x180081d20      # rdx == 0 时安全返回
+...
+180081BE8  movl 0x14(%r14), %eax  # <<< 崩溃：rdx 被当成 TESObjectREFR*
+```
+
+插件声明的是**版本 2** 的布局，槽位 `[11]` 是 `GetOverlayCount(OverlayType, OverlayLocation)`；
+DLL 实现的却是**版本 1**，槽位 `[11]` 是 `RevertHeadOverlays(TESObjectREFR*, bool, bool)`。
+于是 `GetOverlayCount(Spell, Body)` 把 `rdx = 1`（`OverlayType::Spell`）
+当成 `TESObjectREFR*` 传了进去 → 读 `[1+0x14]` = `0x15` → 闪退。
+
+两个布局的差异（前 15 槽）：
+
+```
+槽位  插件（v2）声明的           DLL（v1）实际实现的
+ 2    Revert                      Save
+ 3    HasOverlays                 Load
+ 4    AddOverlays                 Revert
+ 5    RemoveOverlays              HasOverlays
+...
+11    GetOverlayCount             RevertHeadOverlays   <<< 崩溃点
+12    GetOverlayFormat            RevertHeadOverlay
+13    RegisterInstallCallback     SetupOverlay
+14    UnregisterInstallCallback   UninstallOverlay
+```
+
+**为什么以前没炸**：`GetOverlayCount(Normal, ...)` 的 `rdx = 0`，
+而 v1 的 `RevertHeadOverlays` 开头恰好有 `testq %rdx,%rdx; je`，
+所以四次 `Normal` 调用**全部安全返回**，只有 `Spell`（`rdx = 1`）才踩中。
+这就是「能进游戏、玩一小会儿才崩」的原因。
+
+> **教训**：跨 DLL 的接口只要**按名字**获取，就必须**同时**校验版本。
+> `GetVersion()` 在每种布局里都是槽位 `[1]`，是唯一可以在调用任何其它方法之前安全调用的方法 ——
+> 拿它当门禁，代价是一次比较，收益是不会有下一次「调用到了隔壁方法」。
+
+**修法**（仓库自有补丁，见 §33 的补丁机制）：
+
+- 两个插件各自的 `IOverlayInterface` / `IOverrideInterface` / `IBodyMorphInterface`
+  声明上增加 `kSupportedVersion`，并在 `Initialize()` 里**先查版本再采用**；
+  版本不足就**拒绝该接口并打印明确错误**，而不是硬着头皮调用。
+- `IBodyMorphInterface` 是**只追加**的接口（版本 5 只在末尾加了 `AddMorphShapeCallback`），
+  所以版本 4 的声明对版本 5 仍然有效 —— 门禁写成 `>= 4` 而不是 `== 5`。
+- 新增门禁 `Code/plugins/tools/check_skee_abi.py`：把两个插件声明的方法**顺序**
+  与 RaceMenu 的真实顺序逐槽比对，并要求每份声明都带版本门禁。
+  已实测：删掉 `RevertOverlay`、或对调 `GetOverlayCount`/`GetOverlayFormat`、
+  或移除版本门禁，三种改动都会让它失败。
+
+### 37.3 崩溃 B：引擎用**空指针**调用装备钩子来清空槽位
+
+这条在我们自己的运行时里。`Code/client/Games/Skyrim/EquipManager.cpp` 挂了六个
+`EquipManager` 钩子，其中**法术/龙吼**四个直接读形参：
+
+```cpp
+void* TP_MAKE_THISCALL(UnEquipSpellHook, EquipManager, Actor* apActor, TESForm* apSpell, MagicEquipData* apData)
+{
+    if (!apActor)
+        return nullptr;
+
+    const auto pExtension = apActor->GetExtension();
+    if (pExtension->IsRemote() && !ScopedEquipOverride::IsOverriden())
+        return nullptr;
+
+    if (pExtension->IsLocal() && ... )
+    {
+        EquipmentChangeEvent evt{};
+        evt.ActorId = apActor->formID;
+        evt.ItemId = apSpell->formID;                  // <<< apSpell 可能是空指针
+        evt.EquipSlotId = apData->pEquipSlot->formID;  // <<< pEquipSlot 也可能是
+        ...
+```
+
+只有 `apActor` 判了空。**引擎在清空一只手时会用空形式调用这些钩子**，
+于是 `apSpell->formID` 读到 `[0+0x14]` → 崩溃。
+反汇编确认：崩溃指令 `0x18016CFA8 mov 0x14(%r15),%eax`，
+对应源码就是 `apSpell->formID` 这一行（`r15` 由第 4 个参数 `r9` 传入）。
+
+> **注意**：**物品**那两个钩子（`EquipHook`/`UnEquipHook`）里的 `pSlot` 早就写了
+> `apData->pSlot ? apData->pSlot->formID : 0`，说明这个坑**当时是知道的**，
+> 只是没有推广到法术/龙吼那四个 —— 同一个文件里两种写法并存，就是漏改的信号。
+
+**修法**：六个钩子统一改成
+
+1. 形参为空时**原样转发给原函数**（`ThisCall(RealXxx, ...)`），不返回 `nullptr` ——
+   返回 `nullptr` 会让引擎以为「这次装备被取消了」，与清空槽位的行为不符；
+2. `pEquipSlot` 用与物品钩子相同的 `?: 0` 三元写法。
+
+### 37.4 这两个 bug 为什么能一起活这么久
+
+它们都**不会在启动时暴露**：
+
+- A 需要 `OverlayType::Spell` 才会踩中，而 `Normal` 恰好被 DLL 自己的空指针检查兜住；
+- B 需要引擎用空形式清手，而这取决于玩家当时在做什么。
+
+所以「能进游戏、玩一小会儿才崩」是它们的**共同指纹**，
+而不是「内存不够」或「MOD 装多了」。下次看到这个描述，先按 §37.1 找 `target address`。
