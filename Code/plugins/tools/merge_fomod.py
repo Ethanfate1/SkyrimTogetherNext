@@ -161,6 +161,40 @@ def _visible_flags(step, pairs: list[tuple[str, str]]):
         _sub(visible, "flagDependency", flag=name, value=value)
 
 
+def _prerequisite_note(prerequisite: dict, lang: str) -> str:
+    """One sentence naming what has to be installed first."""
+    name = prerequisite["displayName"]
+    if lang == "zh":
+        return f"需要先安装 {name}，否则本插件加载后全部功能保持不可用。"
+    return f"Requires {name} to be installed first; without it this plugin loads but every feature stays unavailable."
+
+
+def _file_dependency(parent, path: str, state: str):
+    dependencies = _sub(parent, "dependencies", operator="And")
+    _sub(dependencies, "fileDependency", file=path, state=state)
+    return dependencies
+
+
+def _prerequisite_type(parent, prerequisite: dict):
+    """Type the entry by whether its prerequisite is actually installed.
+
+    A prerequisite that is merely present on disk but not activated is the exact
+    failure a player reports as "it does nothing", and the FOMOD schema has a
+    type for it (CouldBeUsable) separate from "not installed at all"
+    (NotUsable). Expressing that is what turns the prerequisite from prose in a
+    README into something the installer tells the user about.
+    """
+    descriptor = _sub(parent, "typeDescriptor")
+    dependency = _sub(descriptor, "dependencyType")
+    _sub(dependency, "defaultType", name="NotUsable")
+    patterns = _sub(dependency, "patterns")
+    for state, type_name in (("Active", "Recommended"), ("Inactive", "CouldBeUsable")):
+        pattern = _sub(patterns, "pattern")
+        _file_dependency(pattern, prerequisite["detectFile"], state)
+        _sub(pattern, "type", name=type_name)
+    return descriptor
+
+
 def _step(config, name: str, visible: list[tuple[str, str]] | None = None):
     step = _sub(config, "installStep", name=name)
     if visible:
@@ -211,16 +245,30 @@ def build_config(manifest: dict) -> ET.Element:
         group = _sub(groups, "group", name=text["pluginsGroup"], type="SelectAny")
         plugins = _sub(group, "plugins", order="Explicit")
 
+        # A plugin that drives another mod needs that mod present, and the
+        # wizard is the only place the user is told so before they launch. The
+        # manifest names the file to look for; without it the entry keeps the
+        # plain type.
+        prerequisites = {p["id"]: p for p in manifest.get("prerequisites", [])}
+        requires = manifest.get("requires", {})
+
         for index, plugin in enumerate(optional_plugins(manifest)):
             entry = _sub(plugins, "plugin", name=plugin["displayName"])
-            _sub(entry, "description", _short(plugin["introduction"][lang]))
+            description = _short(plugin["introduction"][lang])
+            prerequisite = prerequisites.get(requires.get(plugin["id"]))
+            if prerequisite:
+                description = f'{description} {_prerequisite_note(prerequisite, lang)}'
+            _sub(entry, "description", description)
             # The transport ships with whichever companion plugin is picked,
             # so a user cannot end up with a plugin whose DLL is missing.
             sources = [(f"{manifest['stageRoot']}/{p['id']}", "") for p in required_plugins(manifest)]
             sources.append((f"{manifest['stageRoot']}/{plugin['id']}", ""))
             _files(entry, sources)
             _flag(entry, plugin["flag"], "on")
-            _type(entry, "Recommended" if index == 0 else "Optional")
+            if prerequisite:
+                _prerequisite_type(entry, prerequisite)
+            else:
+                _type(entry, "Recommended" if index == 0 else "Optional")
 
         for plugin in optional_plugins(manifest):
             sub_options = plugin.get("subOptions") or []

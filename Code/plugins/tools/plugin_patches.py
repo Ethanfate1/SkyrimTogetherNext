@@ -49,7 +49,16 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True) -> subproc
 
 
 def plugins() -> list[dict]:
-    return json.loads((ROOT / MANIFEST_REL).read_text(encoding='utf-8'))['plugins']
+    """Every entry this repository patches: the staged plugins and the
+    prerequisites it depends on.
+
+    Prerequisites are not staged into the archive, but they are submodules this
+    repository builds and pins, so they take patches for exactly the same reason
+    the plugins do - a fix edited into the working tree is discarded by CI's
+    --force checkout and never reaches a release.
+    """
+    manifest = json.loads((ROOT / MANIFEST_REL).read_text(encoding='utf-8'))
+    return manifest['plugins'] + manifest.get('prerequisites', [])
 
 
 def patch_files(plugin_id: str) -> list[Path]:

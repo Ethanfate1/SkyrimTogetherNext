@@ -31,3 +31,6 @@
 [submodule "plugins/TradeTogether"]
 	path = plugins/TradeTogether
 	url = https://github.com/Caelvanost/TradeTogether.git
+[submodule "plugins/OStimNG"]
+	path = plugins/OStimNG
+	url = https://github.com/VersuchDrei/OStimNG.git

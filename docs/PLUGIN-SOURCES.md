@@ -6,6 +6,14 @@ good for following upstream and bad for survival: a submodule records a commit
 hash, and if the repository hosting that commit disappears, the hash points at
 nothing. A submodule is not a backup.
 
+OStim Standalone (`plugins/OStimNG`) is an eighth submodule of the same kind,
+held for a different reason: it is the runtime OStim Together drives, so it is a
+**prerequisite** rather than a companion. It is pinned so the project can state
+which OStim build it supports, patch that build, and check its engine ids
+against every address library this framework ships. It is not staged into the
+archive - a player installs OStim themselves, and its own data tree is 256 MB of
+animations and textures this project neither builds nor ships.
+
 `snapshots/plugins/<id>/` is the backup. It holds the tracked files of each
 plugin at the pinned commit as ordinary content of this repository, so they
 survive in its history.
@@ -16,6 +24,12 @@ survive in its history.
 | What builds | yes | no |
 | Survives upstream deletion | no | yes |
 | What the gates check | the consumer contract | that it matches the pinned commit |
+
+An entry may declare `snapshotScope` to back up only part of its tree.
+OStimNG does: its `data/` is 256 MB of assets nothing here builds, patches or
+ships, so only its code is kept. The scope is declared in the manifest rather
+than inferred from a size threshold, because which files matter is a judgement
+about this project, not a number.
 
 ## Updating a plugin
 

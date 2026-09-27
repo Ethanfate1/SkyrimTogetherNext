@@ -47,24 +47,34 @@ plugin calls STR_QueryPluginMessagingInterface
 Both modules export the same four entry points, so which one a plugin gets is
 decided by which module it queries - and, for the facade, by the ini.
 
-The packaged ini names the **bridge**, not the framework runtime. The reason is
-the game-version split: the runtime is SkyrimTogetherRuntime.dll on 1.6.x/1.7.x
-and SkyrimTogetherRuntime_1_5.dll on 1.5.x, and the facade's loader matches
-exact module names, so one ini cannot name both. Naming either one would leave
-the other game version with no transport at all, and the bridge has one name
-everywhere.
+The packaged ini still names the **bridge**, but inside this framework the
+facade no longer trusts that name alone. Before loading what the ini names, it
+probes for a framework runtime that is *already loaded* - both possible names -
+and uses that in preference. This repository patches the facade to do so
+(`Code/plugins/patches/STRPluginMessagingAPI/`), because the ini alone cannot
+express the choice: the runtime is SkyrimTogetherRuntime.dll on 1.6.x/1.7.x and
+SkyrimTogetherRuntime_1_5.dll on 1.5.x, the facade's loader matches exact module
+names, and one ini has one slot for the name.
 
-The consequence is the opposite of what this document claimed before, so it is
-worth stating plainly: **a plugin that loads STRPluginMessagingAPI.dll by name
-lands on the chat-tunnel bridge, not on the native transport**, inside this
-framework as much as anywhere else. The native transport is reached only by a
-plugin that queries the framework runtime directly, and none of the seven
-companion plugins does that - they all hard-code the facade's module name.
+The probe deliberately uses `GetModuleHandleW` and **never `LoadLibraryW`**. The
+two runtimes are different ABIs compiled from different struct layouts, and both
+files sit in the game root after any install, so loading a name that is merely
+present on disk would pull a cross-ABI image into the process. A runtime that is
+not already loaded is not this plugin's to load; when neither is found the ini's
+value is used exactly as before, so the standalone-bridge scenario is unchanged.
 
-For this framework's own companion plugins the bridge is therefore the live
-path. That is also the path bound to one exact official build, which is why the
-ini records both runtime names for anyone who wants to force the native
-transport on a known game version.
+The consequence is worth stating plainly: **a plugin that loads
+STRPluginMessagingAPI.dll by name now lands on the framework's own transport
+inside this framework**, even though none of the seven companion plugins
+queries the framework directly - they all hard-code the facade's module name.
+
+That matters because the bridge cannot work here at all. Its receive resolver
+scans `SkyrimSE.exe`'s own allocation for the framework's `TransportService`
+RTTI, and that object lives in a separate module, so the resolver never becomes
+ready, `Send` returns `kNotConnected` on every call, and plugin sync fails
+silently. The packaged ini names the bridge only so that a session hosted by an
+unmodified Skyrim Together Reborn server still has a transport; that path is
+unaffected by the probe, which finds no framework runtime there.
 
 ## Identity
 

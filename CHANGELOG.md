@@ -53,7 +53,25 @@ DLL 那里其实是 `RevertHeadOverlays`。于是 `GetOverlayCount(Spell, ...)` 
 版本门禁。**反向验证过三种改坏方式**,每一种都会被它抓到:删掉 `RevertOverlay`、
 对调 `GetOverlayCount`/`GetOverlayFormat`、移除版本门禁。
 
-> 详细取证(反汇编、`target address` 的读法、两个布局的逐槽对照)见 `docs/PITFALLS.md` §37。
+**顺带修掉门禁自己开的一个洞**:门禁**拒绝**接口时只是把指针置空,并**没有**让所有人停止使用它。
+`MorphSyncService::Start()` 在 BodyMorph 接口不可用时确实直接返回,所以同步线程不会启动 ——
+但 `main.cpp` 里**传输层是独立启动的**,`Start()` 失败不会回滚它,于是远端包照收,
+`HandleMorphPacket()` → `TryApplyRemote()` 的漂移分支仍然会执行 `_bodyMorph->ClearMorphs()`
+等四个调用,**全是没判空的解引用**。这条链上 `CaptureMorphs()` 和 `TickOnGameThread()` 都判了空,
+只有「网络上来的那一条」没判 —— 于是它看起来像已经修好了。
+MorphSyncTogether 侧补上这一处判空;
+**OStimTogether 侧查过了,不需要改** —— `RaceMenuOverlayBridge` 里每个取用缓存接口指针的函数
+(如 `ApplyRemoteOverlayChunk` / `RefreshLocalOverlayGeometry`)开头都有
+`if (!overlay || !overrides) { ... return; }`,被拒绝的接口根本走不到调用点。
+判空按「四个调用是一笔事务」处理:进门就返回,
+而不是只做其中一部分把代理留在改了一半的形态上。
+
+**被拒绝之后会掉什么功能** —— 实测本机那份 `skee64.dll`(FileVersion 4.0.0.0,2020-10-04)的
+`GetVersion()`:`BodyMorph` 报 **4**(门禁要求 `>= 4`,**通过**),`Overlay`/`Override` 报 **1**(要求 `>= 2`,拒绝)。
+所以**身体/面部 morph 同步照常工作**,只是覆盖层那一半(阴毛/体毛/面部覆盖层)不再同步;
+两个被拒绝的接口各打一条 `error` 日志说明原因。要不要写 v1 兼容层、以及为什么不该写,见 `docs/PITFALLS.md` §37.6。
+
+> 详细取证(反汇编、`target address` 的读法、两个布局的逐槽对照、拒绝接口之后的残留解引用)见 `docs/PITFALLS.md` §37。
 
 ### 修复:自定义种族的头不显示(任何「头不是本机生成的」角色)
 
@@ -137,6 +155,86 @@ face discoloration and facegen mods`)。
 
 > 详细取证(上游 #764 的完整正文、`merge-base --is-ancestor` 逐个 tag 的版本边界、
 > 以及为什么 tint 纹理那条路不是原因)见 `docs/PITFALLS.md` §38。
+### 新增:OStimNG 作为 OStim Together 的前置 mod 纳入本仓库结构
+
+OStim Standalone 的源码以 `plugins/OStimNG`(子模块,`3954683`)进入本仓库,并在
+`Code/plugins/plugins.json` 的 `prerequisites` 中登记——它不是随包插件,而是
+OStim Together 依赖的运行时。
+
+**为什么是"前置"而不是"打包"**:OStimNG 自己的 `data/` 是 256 MB 的动画、贴图与音效
+(974 个 `.hkx` 153 MB、338 个 `.dds` 71 MB),本仓库既不构建、也不打补丁、更不出货。
+把源码纳入结构是为了**钉住版本、可打补丁、可校验**,不是为了替玩家分发资源。
+
+**快照只备份代码**:`snapshotScope` 在清单里显式声明,只备份 `skse/`、`flash/` 等
+700 个文件 2.4 MB。是否备份由"本项目是否消费它"决定,而不是由一个体积阈值决定。
+
+### 新增门禁:`check_ostimng_versions.py`——"1.5.x 到 1.7.x"从声称变成校验
+
+OStimNG 通过 SKSE 地址库解析引擎地址,而 `REL::ID()` 在 id 缺失时**不是软失败,是
+加载即中止**(CommonLibSSE-NG `REL/IDDB.cpp` 的 `report_id_lookup_failure`)。
+所以"支持 1.5.x 到 1.7.x"是关于**随包地址库里 id 覆盖率**的断言,本门禁逐条核对:
+
+- `RELOCATION_ID(se, ae)` 的 SE id 必须在**每一个** pre-AE 地址库(10 个,含 1.5.97)里;
+- 其 AE id 必须在**每一个** AE 地址库(14 个,含 1.6.1170 / 1.7.104)里。
+
+当前 33 个 `RELOCATION_ID` 站点全部通过。**反向验证过**:把任一 id 改成不存在的值,
+门禁 exit 1 并指名文件与行号。
+
+### 修复:OStimNG 在 1.5.80/1.5.97 上会改坏一条 6 字节指令
+
+`GameHooks.h` 的三处 hook 用 `write_call<5>` / `write_branch<5>`,它们**只覆盖 5 字节**,
+因此只有当站点本身是 5 字节 rel32 分支时才安全。实测 1.5.97 的 `SkyrimSE.exe`:
+
+| 站点 | SE 偏移 | 首字节 | 真实指令 | 结果 |
+| --- | --- | --- | --- | --- |
+| IsThirdPerson | `+0x132` | `E8` | `call rel32`(5B) | 正常安装 |
+| **GetHeading** | `+0x152` | `FF` | **`call [rax+0x520]`(6B)** | **改坏** |
+| PackageStart | `+0x47` | `E9` | `jmp rel32`(5B) | 正常安装 |
+
+`write_call<5>` 在 GetHeading 处会把 6 字节指令劈开:末尾 1 字节 `00` 变成孤立尾巴,
+而且它用 `disp32` 中间四个字节反推"原函数地址",得到 `0x63a8e7`——一个纯属巧合落在
+`.text` 里的地址。
+
+**修法**:打补丁后每处先核对首字节是否等于期望的 opcode,不符则**跳过该 hook 并 warn**,
+而不是写进去。补丁落在 `Code/plugins/patches/OStimNG/`(子模块不可推送,CI 又用
+`--force` 检出,工作区改动会被丢弃)。已用真实 1.5.97 二进制验证:GetHeading 跳过,
+另两处照常安装。
+
+### 修复:OStim Together「没激活」——日志里现在会指名缺 OStim
+
+**根因不是配置,是前置根本没装**。实测该安装的 `skse64.log` 里**只有
+`OStimTogether.dll`,没有 `OStim.dll`**;MO2 的 21 个 mod 里没有任何 OStim;
+`OStimTogether.log` 逐条记录 `OStim.dll module not found` 与十余条
+`unavailable`/`missing`,而插件本身照常 READY。
+
+也就是说:"没激活"的观感,来自**插件加载成功、但每个子系统都自行关闭**,且没有任何
+面向玩家的说明。三处修复:
+
+1. 缺 OStim 时改为 `critical`,并写明要装 OStim Standalone、要确认 `OStim.dll` 与
+   `OStim.esp` 已启用;
+2. FOMOD 向导里 OStim Together 的类型改为**依赖型**:检测 `SKSE/Plugins/OStim.dll`
+   ——`Active` → Recommended,`Inactive` → CouldBeUsable(装了没勾),缺失 → NotUsable;
+3. 描述文字在两种语言下都点名"需要先安装 OStim Standalone"。
+
+### 修复:七个插件的联机同步"装上就是死的"——门面不再只看 ini
+
+出货 ini 把 `STRBridgeModule` 指向桥接,而桥接在本框架内**结构性地收不到任何包**:
+它的接收端在 `SkyrimSE.exe` 自己的分配区里找 `TransportService` 的 RTTI,而本框架的
+`TransportService` 住在独立模块里,于是解析器永不就绪、每次 `send()` 返回
+`kNotConnected`。本次实测再次确认:该安装的 `STRPluginMessagingBridge.log` 反复打印
+`receive resolver: TransportService RTTI type descriptor not uniquely resolved`,
+而 `OStimTogether.log` 记录 `backend=str-bridge knownPeers=0`。
+
+**修法**:给门面打补丁——在读取 ini 指定模块**之前**,先探测**已加载**的框架运行时
+(两个版本名都试),探测到就用它。关键约束:**只用 `GetModuleHandleW`,绝不用
+`LoadLibraryW`**。两个运行时是不同 ABI,且任何安装后两者都躺在游戏根目录,盲目
+`LoadLibrary` 会把跨 ABI 映像拉进进程(这正是 §32.6 记录过的风险)。探测不到时行为
+与原先完全一致,独立桥接场景不受影响。
+
+该行为已由 `check_transport_compat.py` 的新断言绑定:文档必须描述"已加载运行时探测",
+补丁必须同时提到两个运行时名,且**新增代码里不得出现 `LoadLibraryW`**。三种回归都
+反向验证过。
+
 ## v1.1.5(2026-09-27)
 
 ### 文档约定:已修的缺陷不再写进 README

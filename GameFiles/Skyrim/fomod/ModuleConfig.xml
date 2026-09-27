@@ -56,7 +56,7 @@
                 <group name="联机核心已自动安装;以下插件按需选装,可随时重装调整" type="SelectAny">
                     <plugins order="Explicit">
                         <plugin name="OStim Together">
-                            <description>让联机队友之间的动作场景保持同步:场景状态、参与者对齐、装备锁、脱衣与外观修复。需要所有玩家一起安装同一版本;不勾选时,本框架的其余联机功能完全不受影响。</description>
+                            <description>让联机队友之间的动作场景保持同步:场景状态、参与者对齐、装备锁、脱衣与外观修复。需要所有玩家一起安装同一版本;不勾选时,本框架的其余联机功能完全不受影响。 需要先安装 OStim Standalone (OStimNG)，否则本插件加载后全部功能保持不可用。</description>
                             <files>
                                 <folder source="OptionalPlugins/STRPluginMessagingAPI" destination="" priority="0" />
                                 <folder source="OptionalPlugins/OStimTogether" destination="" priority="0" />
@@ -65,7 +65,23 @@
                                 <flag name="ostim">on</flag>
                             </conditionFlags>
                             <typeDescriptor>
-                                <type name="Recommended" />
+                                <dependencyType>
+                                    <defaultType name="NotUsable" />
+                                    <patterns>
+                                        <pattern>
+                                            <dependencies operator="And">
+                                                <fileDependency file="SKSE/Plugins/OStim.dll" state="Active" />
+                                            </dependencies>
+                                            <type name="Recommended" />
+                                        </pattern>
+                                        <pattern>
+                                            <dependencies operator="And">
+                                                <fileDependency file="SKSE/Plugins/OStim.dll" state="Inactive" />
+                                            </dependencies>
+                                            <type name="CouldBeUsable" />
+                                        </pattern>
+                                    </patterns>
+                                </dependencyType>
                             </typeDescriptor>
                         </plugin>
                         <plugin name="MorphSyncTogether">
@@ -301,7 +317,7 @@
                 <group name="The multiplayer core installs automatically; pick any of these, or none" type="SelectAny">
                     <plugins order="Explicit">
                         <plugin name="OStim Together">
-                            <description>Keeps scene state, participant alignment, equipment locks and undress/appearance repair in sync between connected players. Every player must install the same version; leaving it unchecked changes nothing else about the framework.</description>
+                            <description>Keeps scene state, participant alignment, equipment locks and undress/appearance repair in sync between connected players. Every player must install the same version; leaving it unchecked changes nothing else about the framework. Requires OStim Standalone (OStimNG) to be installed first; without it this plugin loads but every feature stays unavailable.</description>
                             <files>
                                 <folder source="OptionalPlugins/STRPluginMessagingAPI" destination="" priority="0" />
                                 <folder source="OptionalPlugins/OStimTogether" destination="" priority="0" />
@@ -310,7 +326,23 @@
                                 <flag name="ostim">on</flag>
                             </conditionFlags>
                             <typeDescriptor>
-                                <type name="Recommended" />
+                                <dependencyType>
+                                    <defaultType name="NotUsable" />
+                                    <patterns>
+                                        <pattern>
+                                            <dependencies operator="And">
+                                                <fileDependency file="SKSE/Plugins/OStim.dll" state="Active" />
+                                            </dependencies>
+                                            <type name="Recommended" />
+                                        </pattern>
+                                        <pattern>
+                                            <dependencies operator="And">
+                                                <fileDependency file="SKSE/Plugins/OStim.dll" state="Inactive" />
+                                            </dependencies>
+                                            <type name="CouldBeUsable" />
+                                        </pattern>
+                                    </patterns>
+                                </dependencyType>
                             </typeDescriptor>
                         </plugin>
                         <plugin name="MorphSyncTogether">

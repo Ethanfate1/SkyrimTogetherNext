@@ -24,6 +24,21 @@
     "is stale. STN owns the one wizard and this manifest is the only source."
   ],
   "stageRoot": "OptionalPlugins",
+  "prerequisites": [
+  {
+      "id": "OStimNG",
+      "displayName": "OStim Standalone (OStimNG)",
+      "submodule": "plugins/OStimNG",
+      "detectFile": "SKSE/Plugins/OStim.dll",
+    "snapshotScope": ["skse", "flash", "OStim_CI.ppj", "README.md", "LICENSE", ".gitignore", ".gitmodules", "move-dll.ps1", "move-flash.ps1"],
+    "snapshotScopeNote": "Only the code is backed up. data/ is 256 MB of animation, texture and sound assets that this project neither builds, patches nor ships, so putting it in this repository to protect files nothing here can regenerate or consume is the wrong trade. The .esp and the scripts under data/Scripts are equally untouched by any patch here.",
+      "why": "The runtime OStim Together drives. OStim Together loads, registers its listeners and reports READY with this mod absent, but every OStim subsystem then reports unavailable and the mod stays inert - which is what a player experiences as OStim Together not being activated.",
+      "staged": false
+  }
+  ],
+  "requires": {
+    "OStimTogether": "OStimNG"
+  },
   "plugins": [
     {
       "id": "STRPluginMessagingAPI",

@@ -48,7 +48,15 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True) -> str:
 
 
 def plugins() -> list[dict]:
-    return json.loads((ROOT / MANIFEST_REL).read_text(encoding='utf-8'))['plugins']
+    """Every submodule this project backs up: the staged plugins and the
+    prerequisites they need.
+
+    A prerequisite is pinned here for the same reason a plugin is - the
+    upstream repository can disappear, and a pointer to a commit nobody
+    hosts is not a backup.
+    """
+    manifest = json.loads((ROOT / MANIFEST_REL).read_text(encoding='utf-8'))
+    return manifest['plugins'] + manifest.get('prerequisites', [])
 
 
 def pinned_sha(plugin_id: str) -> str | None:
@@ -65,6 +73,40 @@ def pinned_sha(plugin_id: str) -> str | None:
 
 def submodule_files(plugin_id: str) -> list[str]:
     return [line for line in run(['git', '-C', f'plugins/{plugin_id}', 'ls-files']).splitlines() if line]
+
+
+def is_checked_out(plugin: dict) -> bool:
+    """Whether the submodule has content, without assuming its layout.
+
+    A gitlink submodule materialises .git as a file, a hand-cloned one as a
+    directory, and the project inside is not always at the root, so neither
+    '.git exists' nor 'CMakeLists.txt exists' is the right test on its own.
+    """
+    submodule = ROOT / plugin['submodule']
+    if not submodule.is_dir():
+        return False
+    return (submodule / '.git').exists() or any(submodule.iterdir())
+
+
+def snapshot_scope(plugin: dict) -> list[str] | None:
+    """The paths an entry backs up, or None for the whole tree.
+
+    OStimNG is 256 MB of animation and texture assets that this project does not
+    build, patch or ship - it only needs the code, so backing up its assets
+    would put a quarter of a gigabyte into this repository's history to protect
+    files nothing here can regenerate or consume. The scope is declared in the
+    manifest rather than inferred from a size threshold, because "which files
+    matter" is a judgement about this project, not a number.
+    """
+    scope = plugin.get('snapshotScope')
+    return scope if scope else None
+
+
+def in_scope(plugin: dict, rel: str) -> bool:
+    scope = snapshot_scope(plugin)
+    if scope is None:
+        return True
+    return any(rel == prefix or rel.startswith(prefix.rstrip('/') + '/') for prefix in scope)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -101,9 +143,9 @@ def pinned_blob(plugin_id: str, rel: str) -> bytes | None:
 
 def snapshot_one(plugin: dict) -> dict:
     plugin_id = plugin['id']
-    submodule = ROOT / 'plugins' / plugin_id
-    if not (submodule / '.git').exists() and not (submodule / 'CMakeLists.txt').exists():
-        raise SystemExit(f"plugins/{plugin_id} is not checked out; run git submodule update --init")
+    submodule = ROOT / plugin['submodule']
+    if not is_checked_out(plugin):
+        raise SystemExit(f"{plugin['submodule']} is not checked out; run git submodule update --init")
 
     target = ROOT / SNAPSHOT_DIR / plugin_id
     if target.exists():
@@ -112,7 +154,7 @@ def snapshot_one(plugin: dict) -> dict:
 
     digest = hashlib.sha256()
     copied = 0
-    for rel in sorted(submodule_files(plugin_id)):
+    for rel in sorted(r for r in submodule_files(plugin_id) if in_scope(plugin, r)):
         source = submodule / rel
         if not source.is_file():
             continue
@@ -178,15 +220,15 @@ def cmd_verify(_args) -> int:
             )
             continue
 
-        submodule = ROOT / 'plugins' / plugin_id
-        if not (submodule / 'CMakeLists.txt').exists():
+        submodule = ROOT / plugin['submodule']
+        if not is_checked_out(plugin):
             failures.append(f"{plugin_id}: submodule not checked out, cannot confirm the snapshot is current")
             continue
 
         digest = hashlib.sha256()
         missing: list[str] = []
         differing: list[str] = []
-        for rel in sorted(submodule_files(plugin_id)):
+        for rel in sorted(r for r in submodule_files(plugin_id) if in_scope(plugin, r)):
             source = submodule / rel
             copy = target / rel
             if not source.is_file():

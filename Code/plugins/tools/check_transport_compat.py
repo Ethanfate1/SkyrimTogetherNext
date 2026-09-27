@@ -107,6 +107,49 @@ else:
             f'runtime, but {INI_REL} names {shipped_value}'
         )
 
+# The document now states that the facade prefers an already-loaded framework
+# runtime over the name the ini ships. That claim is only true while the patch
+# implementing it is present, and a reverted or dropped patch would leave the
+# prose describing a transport the plugins do not actually reach - the same
+# class of drift the STRBridgeModule check above exists to catch.
+PATCH_REL = 'Code/plugins/patches/STRPluginMessagingAPI/0001-prefer-the-framework-transport.patch'
+probe_claim = 'already loaded'
+if 'GetModuleHandleW' not in doc_text or probe_claim not in doc_text:
+    failures.append(
+        f'{DOC_REL} does not describe the already-loaded-runtime probe; a reader '
+        f'cannot tell that the facade prefers the framework over the ini value'
+    )
+else:
+    patch_path = ROOT / PATCH_REL
+    if not patch_path.is_file():
+        failures.append(
+            f'{PATCH_REL} is missing, but {DOC_REL} says the facade probes for an '
+            f'already-loaded framework runtime'
+        )
+    else:
+        patch_text = patch_path.read_text(encoding='utf-8')
+        for required in ('GetModuleHandleW', 'SkyrimTogetherRuntime.dll',
+                         'SkyrimTogetherRuntime_1_5.dll'):
+            if required not in patch_text:
+                failures.append(
+                    f'{PATCH_REL} does not mention {required}; it no longer '
+                    f'implements the probe {DOC_REL} describes'
+                )
+        # Only the patch's own added lines matter, and only their code: the
+        # comment explaining why LoadLibraryW is not used would otherwise read
+        # as the violation it warns against.
+        added_code = [
+            line[1:].split('//')[0]
+            for line in patch_text.splitlines()
+            if line.startswith('+') and not line.startswith('+++')
+        ]
+        if any('LoadLibraryW' in line for line in added_code):
+            failures.append(
+                f'{PATCH_REL} calls LoadLibraryW in added code; the probe must '
+                f'never load a runtime, because the two are different ABIs and '
+                f'both sit on disk after any install'
+            )
+
 print(f'client opcodes: {len(client) - 1} in use, plugin request at index {request_index}')
 print(f'server opcodes: {len(server) - 1} in use, plugin notify at index {notify_index}')
 print(f'chat opcodes  : send {send_index}, broadcast {broadcast_index}')

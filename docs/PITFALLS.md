@@ -3522,6 +3522,123 @@ void* TP_MAKE_THISCALL(UnEquipSpellHook, EquipManager, Actor* apActor, TESForm* 
 所以「能进游戏、玩一小会儿才崩」是它们的**共同指纹**，
 而不是「内存不够」或「MOD 装多了」。下次看到这个描述，先按 §37.1 找 `target address`。
 
+### 37.5 拒绝接口只是**一半**：被拒绝之后，还有代码在解引用它
+
+上面的修法有一个**副作用**，而且它和原崩溃一样是「玩一小会儿才崩」那一类：
+**门禁把接口置空，但置空不等于所有人都不再碰它。**
+
+链条是这样的（三个事实缺一不可）：
+
+1. `MorphSyncService::Start()` 在 `_bodyMorph == nullptr` 时**直接返回**，
+   所以同步线程不启动、`TickOnGameThread()` 一次都不跑 —— 看起来已经安全了。
+2. 但 `main.cpp` 的 `kDataLoaded` 里，**传输层是独立启动的**：
+
+   ```cpp
+   UdpTransport::GetSingleton().Start();          // 先起
+   MorphSyncService::GetSingleton().Start();      // 后起，可能什么都没做
+   TngSync::GetSingleton().Start();
+   ```
+
+   `Start()` 失败**不会**回滚传输层，于是远端包照收。
+3. 收包的落点是同一个服务对象上的 `HandleUdpPacket()` → `HandleMorphPacket()` →
+   `TryApplyRemote()`，而 `TryApplyRemote()` 的**漂移分支**里写着：
+
+   ```cpp
+   _bodyMorph->ClearMorphs(actor);              // <<< 没有判空
+   _bodyMorph->SetMorph(actor, ...);            // <<< 没有判空
+   _bodyMorph->ApplyBodyMorphs(actor, false);
+   _bodyMorph->UpdateModelWeight(actor, false);
+   ```
+
+   另一处 `CaptureMorphs()` **判了空**（`if (!actor || !_bodyMorph)`），
+   所以哈希比较不会崩 —— 也正是这个「同一条路径上有人判、有人没判」的差别，
+   让漏洞看起来像已经修好了。`TickOnGameThread()` 和 `CaptureMorphs()` 都判空，
+   只有**网络上来的这条路**没判。
+
+> **判据**：给接口加门禁时，**不能只问「拒绝之后谁不用它」，还要问「谁还在用它」**。
+> 这一处就是反例：`Start()` 的早退让人以为整条链都停了，
+> 而实际停的只是**本机自己产生数据的那一半**，收到远端数据的那一半还在跑。
+
+**修法**（补丁 `0002-guard-the-refused-bodymorph-interface.patch`）：
+`TryApplyRemote()` 一进来就判 `_bodyMorph` 并返回。
+
+选「进门就判」而不是「在四个解引用前各判一次」，是因为这四个调用是**一笔事务**：
+只做其中的 `SetMorph` 而不做 `ApplyBodyMorphs`，会把代理留在一个**改了一半**的形态上 ——
+比什么都不做更糟。要么整段生效，要么整段不做。
+
+**为什么不用 `Start()` 失败时干脆不启动传输层**：那样会把**外观探测**一起关掉，
+而探测是诊断远端外观问题的唯一信息来源；而且传输层还承载 TNG 同步，
+把「RaceMenu 版本旧」升级成「整个插件不工作」，代价比一个判空大得多。
+
+### 37.6 那份旧 RaceMenu 到底缺了哪一半（实测，不是推测）
+
+有人问：既然门禁会拒绝旧接口，能不能**同时**兼容旧版、再编一份新版的？
+要回答它，先把那份 `skee64.dll`（`FileVersion 4.0.0.0`，2020-10-04，整合包里那份）
+**逐个接口的 `GetVersion()` 读出来** —— 它在每种布局里都是槽位 `[1]`，
+是唯一能在碰其它任何方法之前安全调用的方法：
+
+| 接口 | 该 DLL 报告 | 插件要求 | 门禁结果 |
+| --- | --- | --- | --- |
+| `IBodyMorphInterface` | **4** | `>= 4` | **通过** |
+| `IOverlayInterface` | 1 | `>= 2` | 拒绝 |
+| `IOverrideInterface` | 1 | `>= 2` | 拒绝 |
+
+**这张表就是答案的一半**：插件的**主功能（BodyMorph 同步）在这份旧 RaceMenu 上照常工作** ——
+`IBodyMorphInterface` 报告的正是版本 4，而门禁写的是 `>= 4`。
+被关掉的**只有覆盖层那一半**：阴毛/体毛覆盖层同步、面部覆盖层捕获。
+
+> 佐证：插件声明的 `IBodyMorphInterface` 是 22 个方法，加基类 3 个 = **25 个槽位**；
+> 而这份 DLL 的 `.?AVBodyMorphInterface@@` vtable 实测就是 **25 个函数指针**（版本 4）——
+> 逐槽吻合。说明插件里那份声明**确实抄自真实的 RaceMenu 头**，`kSupportedVersion = 4` 不是猜的。
+
+再把 v1 的 23 个 `IOverlayInterface` 槽位**逐个按它引用的字符串分类**，得到：
+
+- 引用那 8 个节点名字面量的只有槽位 6/7/8、11、21/22；
+- 6/7/8 是遍历全部部位的大家伙，**21/22 把格式当参数传给安装函数**，11 是那个崩过的 Face 回滚；
+- **没有任何一个槽位会「返回」节点名格式**，也没有静态指针表（在 `.rdata`/`.data` 里找过，0 张）。
+
+也就是说**没有任何一个槽位能当 `GetOverlayFormat` 用**（`GetOverlayCount` 的对应物同样没找到）。
+这里说的是「按现成的槽位拼不出来」，不是「DLL 里绝对没有等价逻辑」——
+等价逻辑要存在，也只能藏在那些不引用字面量的槽位里，而那样它的格式来源就无从得知。
+一个 v1 兼容层因此**拼不出来**（不是「调用隔壁方法」那种错位），只能自己硬编码那 8 个字面量、
+再用**已经写好的场景图扫描**（`ParseBodyOverlaySlot` 那条回退路径）去数槽位 ——
+那是**照着反汇编重写一套语义**，不是移植。
+
+**结论：先升级 RaceMenu，不要手写 v1 兼容层。**
+
+1. 新版 RaceMenu 的 Overlay/Override 报 v2+，**零新增代码**就能拿回覆盖层；
+2. 手写兼容层的失败形态**正是本轮修掉的那个**：布局或语义猜错 = 崩在玩家机器上；
+   而我们对 v1 的了解只能来自反汇编 —— 没有头文件，这台机器上也**只有这一份 DLL** 可对照；
+3. 拒绝接口的代价只是一行 `error` 日志 + 没有覆盖层，**morph 同步不受影响**。
+
+要确认自己装的是哪一代，看插件本来就打的这两行即可：
+
+```text
+MST APPEARANCE interfaces READY overlay=1 overlayVersion=1 override=1 overrideVersion=1 ...
+MST RaceMenu BodyMorph interface READY version=4
+```
+
+> **未验证的一环**：这台机器上只有这一份旧 DLL，也无网络，所以**没有实测过任何一份报 v2 的
+> `skee64.dll`** —— 「新版报 v2」来自仓库既有取证与插件声明，不是本轮实测。
+> 升级后若日志仍打印 `overlayVersion=1`，那就说明 v2 并不存在，届时正确的做法是
+> 把声明改成 v1 并修同步路径，而不是维持一个永远拒绝的门禁。
+
+**实测**：这四处解引用是**虚调用**，所以「`Start()` 早退了」根本兜不住 ——
+空指针上的虚调用要读 `[0 + 槽位]`，就是访问违例本身。用一个复刻同一形状的探针
+（把 `_bodyMorph` 换成纯虚接口的空指针）编译运行：
+
+```text
+没有判空 -> exit 0xC0000005 (STATUS_ACCESS_VIOLATION)
+加了判空 -> exit 0
+```
+
+> **反向验证**（照抄即可复现，两处都试过）：
+>
+> 1. 把工作树里新加的判空**删掉**（补丁文件不动），`plugin_patches.py check` 会点名：
+>    `MorphSyncTogether/0002-guard-the-refused-bodymorph-interface.patch is not applied`，退出码 1；
+> 2. 把补丁文件里**任意一行上下文**改一个字，`plugin_patches.py verify` 会报
+>    「does not apply to the pinned commit - the submodule was re-pinned without
+>    rewriting the patch」，退出码 1（见 §33）。
 
 ---
 
@@ -3684,3 +3801,135 @@ pActor = Actor::Create(pNpc);
 
 **反向验证过十种改坏方式**，每一种都被它抓到（含 `FormId` 比较被反过来这一种 ——
 它最初**逃过**了第一版门禁，因为那版只查标记、不查比较，见 §38.7）。
+
+## 39. 2026-09-27 场次:OStimNG 前置化、1.5.x 的 6 字节指令、以及"装上就是死的"三个根因
+
+> **锚点**:本节的修复分别落在
+> `Code/plugins/patches/STRPluginMessagingAPI/0001-prefer-the-framework-transport.patch`、
+> `Code/plugins/patches/OStimNG/0001-verify-the-patch-site-before-writing.patch`、
+> `Code/plugins/patches/OStimTogether/0002-support-ostimng-7-5-1-and-name-the-missing-prerequisite.patch`,
+> 以及新门禁 `Code/plugins/tools/check_ostimng_versions.py`。
+> 查证用 `git log -- Code/plugins`。
+
+### 39.1 "OStim Together 没激活"的根因:前置根本没装,不是配置错
+
+**证据链(全部来自本机实机日志与安装目录,不是推断)**:
+
+| 检查 | 命令/位置 | 结果 |
+| --- | --- | --- |
+| 插件是否加载 | `skse64.log` | **只有** `OStimTogether.dll`(handle 84),`OStim.dll` **一次都没出现** |
+| OStim 是否安装 | MO2 的 `mods/`(21 个) | **没有任何 OStim/OSA/SexLab** |
+| 游戏根目录 | `D:\game\SkyrimSE\Data\SKSE\Plugins\OStim.dll` | **不存在** |
+| 插件自己的日志 | `OStimTogether.log` | `OStim.dll module not found` + 十余条 `unavailable`/`missing` |
+
+关键在于**插件照常 READY**:`STRPM READY`、`PHASE SYNC TRANSPORT READY`、
+`PAPYRUS CONSENT bridge READY` 全都打印了,而 OStim 相关的每个子系统都自行关闭。
+玩家看到的就是"加载了但什么都没发生",日志里没有任何一条面向玩家的说明。
+
+**这不是本仓库的缺陷,而是三处"不告知"**。修法按可见性排序:
+
+1. `OStimBridge::Initialize` 在找不到 `OStim.dll` 时从 `error` 升为 `critical`,
+   并直接写明要装 OStim Standalone、要确认 `OStim.dll` 与 `OStim.esp` 已启用;
+2. FOMOD 向导把 OStim Together 从固定 `Recommended` 改为**依赖型**
+   (`dependencyType`),按 `SKSE/Plugins/OStim.dll` 的 `Active`/`Inactive`/缺失
+   分别给 Recommended / CouldBeUsable / NotUsable。这正是 schema 里
+   `CouldBeUsable`("装了但没激活")存在的理由;
+3. 中英双语描述都点名前置。
+
+> **教训**:一个插件"每个子系统都优雅降级"时,**降级路径本身必须有人告诉用户**。
+> 十二条 `warn` 加起来的信息量,不如一条指名道姓的 `critical`。
+
+### 39.2 OStimNG 在 1.5.80/1.5.97 上会改坏一条 6 字节指令
+
+`GameHooks.h` 三处 hook 用 `write_call<5>`/`write_branch<5>`,CommonLibSSE 的这两个
+模板**只覆盖 5 字节**,且用 `disp32` 反推"原函数地址"。逐字节核对真实
+`SkyrimSE.exe`(1.5.97):
+
+| 站点 | id | SE 偏移 | 首字节 | 真实指令 | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| IsThirdPerson | 36541 | `+0x132` | `E8` | `call rel32`(5B) | 安全 |
+| **GetHeading** | 36541 | `+0x152` | `FF` | **`call [rax+0x520]`(6B)** | **改坏** |
+| PackageStart | 36404 | `+0x47` | `E9` | `jmp rel32`(5B) | 安全 |
+
+在 GetHeading 处:`FF 90 20 05 00 00` 是 6 字节间接调用,而 `write_call<5>` 只写 5 字节,
+末尾那个 `00` 成为孤立尾巴;并且它把 `90 20 05 00` 当成 rel32,算出"原函数"
+= `0x63a8e7`——**纯属巧合落在 `.text` 里**,所以 `check_patch_site_boundary`
+(它只拒绝跨越指令边界的写)不会救,因为写进去的 5 字节本身没越界。
+
+**修法**:每处先核对首字节是否等于期望 opcode,不符则跳过并 `warn`。已用真实二进制
+验证:GetHeading 跳过,另两处照常安装。
+
+> **教训**:`RELOCATION_ID` 只保证**函数入口**在地址库里有映射;它**不保证**
+> "入口 + 硬编码偏移" 落在一条可覆盖的分支指令上。偏移是上游对某个具体版本的假设,
+> 换版本必须重新逐字节核对。
+
+### 39.3 "1.5.x 到 1.7.x"从声称变成门禁
+
+`REL::ID()` 在 id 缺失时**不是软失败**:CommonLibSSE-NG 的 `REL/IDDB.cpp` 走
+`report_id_lookup_failure`,加载即中止。所以"支持某版本区间"等价于
+"该区间的地址库里 id 覆盖齐全",而这是可以逐条核对的:
+
+- `RELOCATION_ID(se, ae)` 的 SE id 必须在**每一个** pre-AE 地址库里(10 个);
+- 其 AE id 必须在**每一个** AE 地址库里(14 个)。
+
+`check_ostimng_versions.py` 做这件事,当前 33 个站点全通过,并已反向验证
+(改一个不存在的 id → exit 1 并指名文件行号)。
+
+> **为什么两个 family 都要查**:只在 1.5.97 上通过、在 1.6.1170 上中止,正是这个门禁
+> 要拦的回归。只查一个版本会**以通过的形式掩盖**另一个版本的加载即崩。
+
+### 39.4 七个插件的同步"装上就是死的":门面只看 ini,而 ini 指向一条死路
+
+§32.4 已经查明链路,本轮用**实机日志**再次确认:
+
+- `STRPluginMessagingBridge.log` 反复打印
+  `receive resolver: TransportService RTTI type descriptor not uniquely resolved`;
+- `OStimTogether.log`:`backend=str-bridge bridgeAvailable=1 bridgeActive=1 knownPeers=0`。
+
+即:桥接的接收端在 `SkyrimSE.exe` **自己的分配区**里找 `TransportService` 的 RTTI,
+而本框架的 `TransportService` 住在独立模块,解析器永不就绪 ⇒ 每次 `send()`
+`kNotConnected` ⇒ **静默失效**。
+
+**修法(本轮新增,§32.6 当时列为"未决")**:给门面打补丁,在按 ini 加载模块**之前**
+先探测**已加载**的框架运行时。关键约束:
+
+> **只用 `GetModuleHandleW`,绝不用 `LoadLibraryW`。**
+
+因为两个运行时是不同 ABI 编译的,且任何安装后**两个 DLL 都躺在游戏根目录**;
+盲目 `LoadLibraryW` 会把跨 ABI 映像拉进进程——这正是 §32.6 证否"默认改回
+`SkyrimTogetherRuntime.dll`"的理由。探测不到时行为与原先完全一致,所以
+"未修改的 STR Reborn 服务器 + 独立桥接"场景不受影响。
+
+该行为由 `check_transport_compat.py` 的新断言绑定:文档必须描述"已加载运行时探测",
+补丁必须同时提到两个运行时名,**且新增代码里不得出现 `LoadLibraryW`**(只看新增行、
+且剥掉注释,否则解释"为什么不用它"的注释会误报)。三种回归都反向验证过。
+
+### 39.5 OStimNG 作为前置进入仓库结构:源码进来,256 MB 资源不进来
+
+`plugins/OStimNG` 是第八个子模块,登记在 `prerequisites` 而**不是** `plugins`:
+
+- 进 `plugins` 会把它送进 staging 流水线,而它 `payload` 为空 ⇒
+  `Add-PluginPayload.ps1` 直接 `throw`("staged plugin is empty"),打包全断;
+- 它不是随包插件,是**前置**:玩家自己装 OStim,本仓库只负责钉版本、可打补丁、可校验。
+
+**快照只备份代码**:`snapshotScope` 显式声明只备份 `skse/`、`flash/` 等
+(703 个文件 2.4 MB),而不是 2985 个文件 256 MB。是否备份由"本项目是否消费它"决定,
+不由体积阈值决定。
+
+**顺带修掉一个不一致**:`plugin_snapshot.py` 里 `snapshot` 用 ".git 存在"、
+`verify` 用 "CMakeLists.txt 存在" 判断子模块是否检出。OStimNG 的项目在
+`skse/CMakeLists.txt`,于是 `verify` 永远报"未检出"。现统一为
+`is_checked_out()`——子模块项目不总在根目录。
+
+> **教训**:同一份清单被两个函数用**两种写法**判断同一件事,就是一次迟早会发生的
+> 假失败。判断"子模块在不在"不该假设它的内部布局。
+
+### 39.6 本轮新增的门禁与反向验证
+
+| 门禁 | 拦什么 | 反向验证 |
+| --- | --- | --- |
+| `check_ostimng_versions.py` | id 缺失导致加载即中止 | 改一个 id → exit 1 |
+| `check_transport_compat.py`(扩展) | 文档与补丁脱节、误用 `LoadLibraryW` | 改文档 / 改补丁 → 均 exit 1 |
+| `plugin_snapshot.py`(`snapshotScope`) | 把 256 MB 资源写进历史 | `verify` 认 8 个子模块 |
+| `plugin_patches.py`(含 prerequisites) | 前置的补丁不被应用 | 7 个补丁全 verify |
+

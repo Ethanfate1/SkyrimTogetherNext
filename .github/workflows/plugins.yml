@@ -153,6 +153,18 @@ jobs:
         shell: pwsh
         run: python Code/plugins/tools/check_skee_abi.py
 
+      # OStimNG is the prerequisite OStim Together drives, and it resolves
+      # engine addresses through the SKSE address library. An id absent from the
+      # library for the runtime actually running does not degrade: REL::ID()
+      # aborts the game at load. "1.5.x through 1.7.x" is therefore a claim about
+      # id coverage in the shipped libraries, and it is checked rather than
+      # assumed - for every pre-AE library and every AE one, because passing on
+      # 1.5.97 while aborting on 1.6.1170 is exactly the regression this exists
+      # to catch.
+      - name: Verify OStimNG loads on every supported runtime
+        shell: pwsh
+        run: python Code/plugins/tools/check_ostimng_versions.py
+
       # CODE_GUIDELINES.md makes documentation part of every version change.
       # This is what enforces it: the coverage figures in prose must match the
       # generator, both README version tables must cover every changelog

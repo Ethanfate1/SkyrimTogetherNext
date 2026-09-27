@@ -200,6 +200,64 @@ jobs:
           python Code/plugins/tools/plugin_patches.py apply
           if ($LASTEXITCODE -ne 0) { throw 'a plugin patch did not apply; the submodule pin probably moved' }
 
+      # OStimNG is the prerequisite OStim Together drives, and this repository
+      # patches it (Code/plugins/patches/OStimNG/). Nothing else compiles that
+      # patch: the plugin build below only covers plugins/, and an unbuilt patch
+      # is a fix that reaches no player. It is configured through vcpkg like the
+      # plugins, so it runs after the vcpkg setup and shares its binary cache.
+      #
+      # Build only, no artifact: OStim is installed by the player and is not
+      # staged into the archive, so nothing here is collected. What this proves
+      # is that the pinned OStimNG plus this repository's patches still compile.
+      - name: Build the OStimNG prerequisite
+        id: ostimng
+        if: steps.plugins.outputs.present == 'true'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'plugins/OStimNG/skse/CMakeLists.txt')) {
+            Write-Host '::warning::plugins/OStimNG is not checked out; skipping the prerequisite build'
+            "built=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          if (-not $env:VCPKG_ROOT) { throw 'VCPKG_ROOT is not set; the vcpkg setup step did not run' }
+
+          # OStimNG reads this variable and fails configure without it. The
+          # submodule checkout above is --recursive, so OStimNG's own pinned
+          # CommonLibSSE-NG is already on disk; use it rather than a second
+          # clone, so the prerequisite builds against the revision it pins.
+          $commonlib = 'plugins/OStimNG/skse/extern/CommonLibSSE-NG'
+          if (-not (Test-Path (Join-Path $commonlib 'CMakeLists.txt'))) {
+            throw "OStimNG's pinned CommonLibSSE-NG is missing at $commonlib; the recursive submodule checkout did not populate it"
+          }
+          $env:COMMONLIB_SSE_FOLDER = (Resolve-Path $commonlib).Path
+          Write-Host "COMMONLIB_SSE_FOLDER=$env:COMMONLIB_SSE_FOLDER
+          Write-Host "COMMONLIB_SSE_FOLDER=$env:COMMONLIB_SSE_FOLDER"
+
+          $toolchain = Join-Path $env:VCPKG_ROOT 'scripts/buildsystems/vcpkg.cmake'
+          if (-not (Test-Path -LiteralPath $toolchain)) { throw "vcpkg toolchain not found at $toolchain" }
+
+          $configureLog = & cmake -S plugins/OStimNG/skse -B plugins/OStimNG/build -A x64 "-DCMAKE_TOOLCHAIN_FILE=$toolchain" 2>&1
+          $configureCode = $LASTEXITCODE
+          $configureLog | ForEach-Object { Write-Host $_ }
+          if ($configureCode -ne 0) {
+            $tail = ($configureLog | Where-Object { $_ -match 'error|Error|CMake Error|not found|Could not|Unable' } | Select-Object -Last 6)
+            if (-not $tail) { $tail = ($configureLog | Select-Object -Last 6) }
+            $detail = ($tail -join ' | ') -replace '%', '%25' -replace '\r', '' -replace '\n', '%0A'
+            Write-Host "::error title=OStimNG configure failed::$detail"
+            throw 'OStimNG configure failed'
+          }
+
+          $buildLog = & cmake --build plugins/OStimNG/build --config Release --parallel 2>&1
+          $buildCode = $LASTEXITCODE
+          $buildLog | ForEach-Object { Write-Host $_ }
+          if ($buildCode -ne 0) {
+            $tail = ($buildLog | Where-Object { $_ -match 'error|Error' } | Select-Object -Last 6)
+            if (-not $tail) { $tail = ($buildLog | Select-Object -Last 6) }
+            $detail = ($tail -join ' | ') -replace '%', '%25' -replace '\r', '' -replace '\n', '%0A'
+            Write-Host "::error title=OStimNG build failed::$detail"
+            throw 'OStimNG build failed'
+          }
+          "built=true" >> $env:GITHUB_OUTPUT
       - name: Build companion plugins
         id: companion
         if: steps.plugins.outputs.present == 'true'
