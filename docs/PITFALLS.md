@@ -3521,3 +3521,166 @@ void* TP_MAKE_THISCALL(UnEquipSpellHook, EquipManager, Actor* apActor, TESForm* 
 
 所以「能进游戏、玩一小会儿才崩」是它们的**共同指纹**，
 而不是「内存不够」或「MOD 装多了」。下次看到这个描述，先按 §37.1 找 `target address`。
+
+
+---
+
+## 38. 2026-09-27 场次：自定义种族的头看不见 —— 一行「为别人好」的上游回退
+
+### 38.1 报告里那句最有用的话
+
+issue 原文是「自定义种族带上自带头部 `.nif`/`.tri` 时头是隐形的」，
+但真正定位问题的是**下一句**：
+
+> Nolvus v6 uses custom meshes .nif/.tri for vanilla races (HPH High Poly Head and
+> Expressive Facegen) so it probably isn't related to custom .nif or .tri files.
+> It probably relates to using custom races? Because vanilla races with custom head
+> meshes work fine
+
+把这两句并起来看，变量**不是** `.nif`/`.tri`，**也不是**「自定义种族」这四个字，
+而是「**这张脸是不是在本机生成的**」：
+
+| 场景 | 头网格从哪来 | 磁盘上有对应 FaceGenData 吗 | 结果 |
+| --- | --- | --- | --- |
+| 原版种族 + 自定义头部网格 | race 自带的 `.nif` | **有**（原版就有烘焙资源） | 正常 |
+| 自定义种族 + 自带头部网格 | race 自带的 `.nif` | **没有** | **头隐形** |
+| 远端玩家的任意种族 | 网络传过来、本机重建 | **没有** | 受影响的那一批 |
+
+报告者后面还给了致命的一条：**STR rfortier 1.7.1.42 上一切正常**。
+版本边界一旦被说清楚，剩下的就是找「1.7.1 和 1.1.x 之间，谁动了这条路」。
+
+### 38.2 一行代码，两个方向
+
+1.7.1 的 `TiltedOnlineApp::Update()` 里有：
+
+```cpp
+// Every frame make sure we won't use preprocessed facegen
+POINTER_SKYRIMSE(uint32_t, bUseFaceGenPreprocessedHeads, 378620);
+*bUseFaceGenPreprocessedHeads = 0;
+```
+
+上游 PR **#764**（commit `7e09f8b4`，`Now respects bUseFaceGenPreprocessedHeads flag.`）
+把这**两行删掉了**，PR 正文自己写了动机：
+
+> Closes #92 Closes #448 ... fixes things like neck seams and black faces
+
+v1.8.0 发布说明同样直说：
+
+> Re-enabled `bUseFaceGenPreprocessedHeads`; this fixes occasional mismatched heads,
+> face discoloration and facegen mods
+
+也就是说**同一行开关，两个方向各有各的受害者**：
+
+- 强制关掉（1.7.1 的做法）→ **没有烘焙资源的角色头是空的**（本 issue）；
+- 保持打开（#764 之后）→ **有烘焙资源但脸被改过的角色**脖子接缝、黑脸、头部错配。
+
+任何「二选一」的修法都必然得罪另一边，所以我们不能只是把那两行加回去。
+
+### 38.3 版本边界必须自己验，不能凭「应该是」
+
+判据不是「读到过 PR」，而是**每个 tag 是否含那个 commit**：
+
+```powershell
+foreach ($r in @('v1.0.40','v1.0.41','v1.1.0','v1.1.1','v1.1.5','HEAD','upstream/master','v1.7.1','v1.8.0')) {
+  git merge-base --is-ancestor 7e09f8b4 $r
+  if ($LASTEXITCODE -eq 0) { "$r CONTAINS the revert" } else { "$r does NOT contain the revert" }
+}
+```
+
+结果：1.0.40 / 1.0.41 / 1.1.0 / 1.1.1 / 1.1.5 / HEAD / upstream master 与 dev / **v1.8.0 全为「含」**，
+**只有 v1.7.1 是「不含」** —— 与「1.7.1 好、1.1.x 坏」**逐字吻合**。
+
+> 这类判断**必须**用 `merge-base --is-ancestor` 逐个 ref 跑。
+> 用「在某个版本的文件里 grep 一下」代替，会漏掉 revert 之后又被别的提交改回来的情况。
+
+### 38.4 一次排错：为什么不是 tint 纹理那条路
+
+我们本来就有 `FaceGenSystem`，而且它在**远端玩家**身上真的会跑，
+所以第一反应是「那里的 tint 纹理生成坏了」。逐条对下来，**它不是原因**：
+
+1. `FaceGenSystem::Update` 只在 `FaceGenComponent` 存在时才被调用，
+   而那个组件由 `FaceGenSystem::Setup` 建立，后者在 `acTints.Entries.empty()` 时**直接返回**；
+2. `Update` 还要求 `pActorBase->GetHeadPart(1)` **和**一个蒙版着色器（`NiMaskedShaderRTTI`）同时成立，
+   两道门都过不去时它根本不执行；
+3. 最要紧的是：**tint 是给已经存在的头部几何体贴图层**，而本 issue 是**头部节点压根没建出来**。
+   一个画在不存在的东西上的 bug，不可能让头消失。
+
+教训：**先确认「哪个阶段没跑」，再去查那个阶段的代码**。
+现象是「看不见」时，不区分「没生成几何体」和「生成了但贴图是错的」，
+就会在 tint 那条路上白查很久。
+
+### 38.5 仓库里躺着一个专为此写的函数，却没人调用
+
+`Code/client/Games/Skyrim/Actor.cpp` 里一直有：
+
+```cpp
+void Actor::QueueUpdate() noexcept
+{
+    auto* pSetting = INISettingCollection::Get()->GetSetting("bUseFaceGenPreprocessedHeads:General");
+    const auto originalValue = pSetting->data;
+    pSetting->data = 0;
+
+    TP_THIS_FUNCTION(TQueueUpdate, void, Actor, bool);
+    POINTER_SKYRIMSE(TQueueUpdate, QueueUpdate, 40255);
+
+    TiltedPhoques::ThisCall(QueueUpdate, this, true);
+
+    pSetting->data = originalValue;
+}
+```
+
+**它把开关临时关掉、调用引擎更新、再放回去** —— 正是「按需强制一次运行时生成」。
+但把 `v1.0.40` / `v1.0.41` / `v1.1.1` / `v1.1.5` / `HEAD` / `upstream/master` / `upstream/dev` / `v1.7.1` / `v1.8.0`
+**全部 ref** 都 grep 过：**只有它自己的定义，没有任何调用点**。
+它之所以变得没用，是因为当年选择了「每帧全局清零」这条路 ——
+全局清零在的时候，谁都不需要按需调用它；
+而 #764 把全局清零删掉之后，**没有任何东西想起它来**。
+
+> 这就是「有实现、没接线」的典型：**死代码不会报错，也不会过期**。
+> 它会在几年后看起来像「已经处理过了」，让下一个人以为这条路已经走通。
+
+### 38.6 修法：把「清零」收窄到真正需要它的角色
+
+判据是 `WaitingFor3D`：
+
+- 它由 `OnCharacterSpawn` 在**外观来自网络**时挂上（`CharacterSpawnRequest`）；
+- 它的 `SpawnRequest.FormId == GameId{}` 表示**这个 base 是在本机从缓冲区重建的**
+  （`TESNPC::Create` 路径），也就是「磁盘上不可能有对应烘焙网格」；
+- 它被移除的那一刻，正是引擎把 3D 建好的那一刻（`GetNiNode()` 非空）。
+
+于是窗口开在「需要」与「建好」之间，**由这个组件自己推导**，不靠配对开关：
+
+```cpp
+// CharacterService::OnUpdate，每帧
+UpdateRemoteFaceGenWindow();
+
+// 两个生成路径上，在把 actor 交给引擎之前
+SetRemoteFaceGenForce(true);
+pActor = Actor::Create(pNpc);
+```
+
+三个容易写错的地方，当时都踩了一遍：
+
+1. **顺序**：先 `Actor::Create` 再开窗是**错的** —— 身体要到**下一帧**才建，
+   而读取这个开关的是那一帧的引擎代码。门禁因此专门查这个先后顺序；
+2. **还原值**：必须**存原值再存回去**，不能写死成 `1`。
+   这个 INI 不是我们拥有的，玩家自己关过就得保持关着；
+3. **不要加超时**：一开始加了个「开窗时记录 15 秒截止」的兜底，随即发现
+   它**对第二个才开始等待的角色是错的**（那个 actor 一来，截止时间早就过了，
+   窗口在它第一帧就被关掉 —— 隐形的头又回来了）。
+   最终**故意不加超时**：最坏情况（某个 actor 永远没建出 3D、开关一直关着）
+   正好**就是 1.7.1 的行为**，也就是报告者说「好」的那个版本。
+
+> 想清楚「最坏情况是否可接受」，比硬造一个「看起来更严谨」的兜底更重要 ——
+> 那个兜底会引入一个更难查的、只在第二个玩家进服时出现的新 bug。
+
+### 38.7 门禁
+
+`Tools/Scripts/check_facegen_scope.py` —— 读源码前**先剥注释**
+（否则 `TiltedOnlineApp.cpp` 那段解释「为什么删掉」的长注释会被当成「代码里还有」），
+然后查：全局清零没回来；每个写这开关的地方都「先存后还原」；
+窗口按「来自网络」定界；窗口在 `Actor::Create` **之前**打开；
+每帧关窗；取 INI 前判空。
+
+**反向验证过十种改坏方式**，每一种都被它抓到（含 `FormId` 比较被反过来这一种 ——
+它最初**逃过**了第一版门禁，因为那版只查标记、不查比较，见 §38.7）。

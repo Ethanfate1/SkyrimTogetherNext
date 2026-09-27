@@ -54,6 +54,89 @@ DLL 那里其实是 `RevertHeadOverlays`。于是 `GetOverlayCount(Spell, ...)` 
 对调 `GetOverlayCount`/`GetOverlayFormat`、移除版本门禁。
 
 > 详细取证(反汇编、`target address` 的读法、两个布局的逐槽对照)见 `docs/PITFALLS.md` §37。
+
+### 修复:自定义种族的头不显示(任何「头不是本机生成的」角色)
+
+**现象**:用**自带头部 `.nif`/`.tri` 的自定义种族**时,头是**隐形**的 ——
+没有用 RaceMenu 雕刻、没有套预设、没有动任何滑块,只是把种族自带的头部网格直接用上。
+报告者补了一条关键线索:**同一套自定义头部网格配原版种族是正常显示的**
+(Nolvus v6 给原版种族换的就是 HPH High Poly Head + Expressive Facegen),
+而这一切在 **STR 1.7.1.42 上都是好的**。所以既不是 `.nif`/`.tri` 本身的问题,也不只是「自定义种族」四个字,
+而是**「这张脸不是在本机生成的」**。
+
+**根因:上游 #764 删掉了「强制运行时生成脸」那一行。**
+
+引擎用 `bUseFaceGenPreprocessedHeads`(默认 **1**)决定角色的头从哪来:
+从磁盘上预先烘焙好的 `Data\meshes\actors\character\FaceGenData\FaceGeom\<插件>\<formid>.nif` 加载,
+还是**当场生成**。远端玩家的外观是**序列化后传过来、在本机重建**的,
+它描述的那张脸**从没在本机生成过**,所以磁盘上**不存在**匹配的烘焙网格 ——
+引擎照默认路径去找、找不到,头就是空的。
+
+自定义种族踩得最狠,因为**它的头只以种族自带的 `.nif`/`.tri` 形式存在,从来没有 FaceGenData**;
+而原版种族即使换了自定义头部网格,那些烘焙资源仍然对得上,所以「原版种族 + 自定义头」正常 ——
+这正是报告里「vanilla races with custom head meshes work fine」的由来。
+
+1.7.1 之所以是好的,是因为它**每帧**都在执行:
+
+```cpp
+// Every frame make sure we won't use preprocessed facegen
+POINTER_SKYRIMSE(uint32_t, bUseFaceGenPreprocessedHeads, 378620);
+*bUseFaceGenPreprocessedHeads = 0;
+```
+
+上游 PR #764(`7e09f8b4`,`Now respects bUseFaceGenPreprocessedHeads flag.`)把这行删了,
+为的是修**原版角色**的脖子接缝、黑脸与头部错配(v1.8.0 发布说明:
+`Re-enabled bUseFaceGenPreprocessedHeads; this fixes occasional mismatched heads,
+face discoloration and facegen mods`)。
+**本仓库每个 1.1.x 都含这个删除,而报告者说好的 1.7.1 不含** —— 版本边界与报告完全吻合
+(`git merge-base --is-ancestor 7e09f8b4` 对 v1.1.0/1.1.1/1.1.5/HEAD 为真,对 v1.7.1 为假)。
+
+仓库里其实**一直躺着一个专为此写的函数**:`Code/client/Games/Skyrim/Actor.cpp` 的
+`Actor::QueueUpdate()` —— 它把该 INI 置 0、调用引擎的 Actor 更新、再把值放回去,
+正是「按需强制一次运行时生成」。但它**从未被任何调用点引用**
+(1.0.x 到 1.8.x、以及上游 master/dev 全部 ref 都 grep 过,只有它自己的定义),
+因为当年走的是「每帧全局清零」那条路。
+
+**修法:把「清零」收窄到真正需要它的角色上。**
+
+`CharacterService` 新增一个**窗口**:
+
+- `SetRemoteFaceGenForce(true)` 在**两个**「外观来自网络」的生成路径上、
+  **在把 actor 交给引擎之前**调用(引擎要到**下一帧**才建身体,晚一步就晚了);
+- 它先把**当前值存下来**,关窗时**存回原值**,不写死成 1 ——
+  这个设置不是我们拥有的,玩家自己关过就得保持关着;
+- `UpdateRemoteFaceGenWindow()` **每帧**从 `WaitingFor3D` 推导窗口该不该开:
+  只看 `FormId == GameId{}`(即 base 是**在本机从缓冲区重建**的)那些角色。
+  用「推导」而不是「配对开关」是故意的 —— 断线、生成失败、角色被删都会自动掉出这个视图,
+  不需要谁记得去关,与它下面那个早就在等同一个组件的 `RunSpawnUpdates` 一致。
+
+于是**两边都满足**:本机生成的角色(玩家的,以及所有磁盘上就有烘焙头的 NPC)
+继续走 #764 想要的预处理路径,脖子接缝那个修复不被回退;
+只有**头从网络来**的角色改用运行时生成 —— 也就是那些隐形的头。
+
+### 新增门禁:预处理头部开关的作用域
+
+新增 `Tools/Scripts/check_facegen_scope.py`(读源码前**先剥注释**),查五件事:
+
+1. **全局清零不准回来** —— 它正是 #764 回退掉的东西,
+   在 `TiltedOnlineApp.cpp` 里重新加回会被抓(那里长的注释里提到该设置不算);
+2. **每个写这个开关的地方都必须「先存后还原」** —— 包括那个没被调用的 `Actor::QueueUpdate()`,
+   它是个正确的存/还原,门禁要求它保持正确;
+3. **窗口必须按「来自网络」定界**(等 3D + 空的 FormId),否则不是恒开就是恒关;
+4. **窗口必须在 `Actor::Create` 之前打开** —— 身体是后面那一帧才建的;
+5. **每帧必须关窗**,以及**取 INI 前必须判空**。
+
+**反向验证过十种改坏方式**,每一种都被抓到:重新加回全局清零;
+两处生成路径各自把开窗挪到 `Actor::Create` 之后;去掉每帧关窗;
+把窗口放大成「所有等待中的角色」;把 `FormId` 比较反过来;
+从视图里去掉 `RemoteComponent`;去掉 INI 判空;两个「先存后还原」各丢掉一次还原。
+
+> 其中「把 `FormId` 比较反过来」**最初逃过了第一版门禁** —— 那一版只查标记是否存在、
+> 不查它是不是那个比较,已改成用正则校验比较本身。改坏方式能被自己写的门禁漏掉,
+> 只有真去改一遍才会发现。
+
+> 详细取证(上游 #764 的完整正文、`merge-base --is-ancestor` 逐个 tag 的版本边界、
+> 以及为什么 tint 纹理那条路不是原因)见 `docs/PITFALLS.md` §38。
 ## v1.1.5(2026-09-27)
 
 ### 文档约定:已修的缺陷不再写进 README

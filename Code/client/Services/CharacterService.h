@@ -103,6 +103,8 @@ private:
 
     void RunLocalUpdates() const noexcept;
     void RunRemoteUpdates() noexcept;
+    void UpdateRemoteFaceGenWindow() noexcept;
+    void SetRemoteFaceGenForce(bool aForce) const noexcept;
     void RunFactionsUpdates() const noexcept;
     void RunSpawnUpdates() const noexcept;
     void RunExperienceUpdates() noexcept;
@@ -133,6 +135,12 @@ private:
     // Actor form ID -> pick form ID. The active stage lives in ActorExtension.
     // Written from const message handlers, drained by ProcessLeveledConforms.
     mutable Map<uint32_t, uint32_t> m_pendingLeveledConforms{};
+
+    // Set while an actor whose appearance arrived over the wire still has no 3D,
+    // together with the value bUseFaceGenPreprocessedHeads had before the window
+    // opened. See SetRemoteFaceGenForce for why the two live together.
+    mutable bool m_faceGenForced = false;
+    mutable uint64_t m_faceGenPreprocessedBackup = 0;
 
     entt::scoped_connection m_referenceAddedConnection;
     entt::scoped_connection m_referenceRemovedConnection;

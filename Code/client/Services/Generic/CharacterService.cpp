@@ -287,6 +287,7 @@ void CharacterService::OnActorRemoved(const ActorRemovedEvent& acEvent) noexcept
 
 void CharacterService::OnUpdate(const UpdateEvent& acUpdateEvent) noexcept
 {
+    UpdateRemoteFaceGenWindow();
     RunSpawnUpdates();
     RunLocalUpdates();
     RunFactionsUpdates();
@@ -540,6 +541,10 @@ void CharacterService::OnCharacterSpawn(const CharacterSpawnRequest& acMessage) 
             pNpc = TESNPC::Create(acMessage.AppearanceBuffer, acMessage.ChangeFlags);
             FaceGenSystem::Setup(m_world, *entity, acMessage.FaceTints);
         }
+
+        // The engine builds this body on a later tick, and SetRemoteFaceGenForce has
+        // to be in effect before it does.
+        SetRemoteFaceGenForce(true);
 
         pActor = Actor::Create(pNpc);
     }
@@ -1601,6 +1606,10 @@ Actor* CharacterService::CreateCharacterForEntity(entt::entity aEntity) const no
             FaceGenSystem::Setup(m_world, aEntity, acMessage.FaceTints);
         }
 
+        // As in OnCharacterSpawn: this base came off the wire, so the head has to be
+        // generated at runtime once the engine builds the body.
+        SetRemoteFaceGenForce(true);
+
         pActor = Actor::Create(pNpc);
     }
 
@@ -1850,6 +1859,72 @@ void CharacterService::RunLocalUpdates() const noexcept
     }
 
     m_transport.Send(message);
+}
+
+void CharacterService::SetRemoteFaceGenForce(const bool aForce) const noexcept
+{
+    // bUseFaceGenPreprocessedHeads decides whether the engine loads a head that was
+    // baked to disk or generates one at runtime. It is cleared only while this
+    // client is building an actor whose appearance arrived over the wire, because
+    // no baked head can match a face that was never generated here: the lookup
+    // finds nothing and the head comes up empty, which is the invisible head a
+    // custom race reports - a custom race ships its head as a .nif/.tri and never
+    // as FaceGenData. Upstream #764 removed the unconditional per-frame clear this
+    // fork used to run, and that clear was the only thing asking for runtime
+    // generation; keeping it scoped to wire-built actors is what lets locally
+    // generated characters keep the baked head the flag is wanted for (see the
+    // comment in TiltedOnlineApp::Update).
+    if (m_faceGenForced == aForce)
+        return;
+
+    auto* pSetting = INISettingCollection::Get()->GetSetting("bUseFaceGenPreprocessedHeads:General");
+    if (!pSetting)
+        return; // nothing to force, and leaving the state alone keeps the next call honest
+
+    if (aForce)
+        m_faceGenPreprocessedBackup = pSetting->data;
+
+    pSetting->data = aForce ? 0 : m_faceGenPreprocessedBackup;
+    m_faceGenForced = aForce;
+
+    spdlog::debug("{}: bUseFaceGenPreprocessedHeads = {} (was {})", __FUNCTION__, pSetting->data, m_faceGenPreprocessedBackup);
+}
+
+void CharacterService::UpdateRemoteFaceGenWindow() noexcept
+{
+    // The window stays open only while such an actor is still waiting for its body.
+    // Deriving it from the components every frame instead of counting opens and
+    // closes is deliberate: the actor stops matching the moment its 3D arrives, and
+    // a disconnect clears RemoteComponent, so the flag restores itself without
+    // anyone having to remember to close it.
+    bool needsRuntimeFaceGen = false;
+
+    // RemoteComponent belongs in the predicate: disconnecting clears it without
+    // touching WaitingFor3D, so without it the window would stay open past the
+    // session that needed it and put every later actor back on runtime generation.
+    const auto waitingView = m_world.view<WaitingFor3D, RemoteComponent>();
+
+    for (auto entity : waitingView)
+    {
+        // An empty FormId is the wire-built path: the base was rebuilt here from the
+        // appearance buffer rather than resolved out of the local load order, so its
+        // face is not the face those baked assets were generated for.
+        if (waitingView.get<WaitingFor3D>(entity).SpawnRequest.FormId == GameId{})
+        {
+            needsRuntimeFaceGen = true;
+            break;
+        }
+    }
+
+    // There is deliberately no timeout on this. A timer armed when the window opens
+    // would already have expired for a second actor that starts waiting later, and
+    // closing the window on that actor's first frame is the invisible head again.
+    // The state this can leave behind - a body that never materializes keeps the
+    // flag cleared - is exactly what shipped as 1.7.1, which is the build this
+    // report calls working. RunSpawnUpdates below waits on the same component and
+    // has no timeout either.
+
+    SetRemoteFaceGenForce(needsRuntimeFaceGen);
 }
 
 void CharacterService::RunRemoteUpdates() noexcept

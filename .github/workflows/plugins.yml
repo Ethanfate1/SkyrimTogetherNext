@@ -25,6 +25,13 @@ on:
       - 'GameFiles/Skyrim/fomod/**'
       - 'Tools/Packaging/**'
       - 'Tools/Scripts/papyrus_archive.py'
+      # The facegen gate reads the client's spawn paths, so a change to the code
+      # it guards has to run it - otherwise the scope can be widened back to a
+      # client-wide force without CI noticing.
+      - 'Code/client/Services/**'
+      - 'Code/client/Games/**'
+      - 'Code/client/TiltedOnlineApp.cpp'
+      - 'Tools/Scripts/check_facegen_scope.py'
       # The documentation gate reads these, so a change to any of them has to
       # run it - otherwise a stale number can be pushed without CI noticing.
       - 'Tools/Scripts/check_docs.py'
@@ -47,6 +54,13 @@ on:
       - 'GameFiles/Skyrim/fomod/**'
       - 'Tools/Packaging/**'
       - 'Tools/Scripts/papyrus_archive.py'
+      # The facegen gate reads the client's spawn paths, so a change to the code
+      # it guards has to run it - otherwise the scope can be widened back to a
+      # client-wide force without CI noticing.
+      - 'Code/client/Services/**'
+      - 'Code/client/Games/**'
+      - 'Code/client/TiltedOnlineApp.cpp'
+      - 'Tools/Scripts/check_facegen_scope.py'
       # The documentation gate reads these, so a change to any of them has to
       # run it - otherwise a stale number can be pushed without CI noticing.
       - 'Tools/Scripts/check_docs.py'
@@ -138,6 +152,21 @@ jobs:
       - name: Verify the SKEE interface declarations
         shell: pwsh
         run: python Code/plugins/tools/check_skee_abi.py
+
+      # CODE_GUIDELINES.md makes documentation part of every version change.
+      # This is what enforces it: the coverage figures in prose must match the
+      # generator, both README version tables must cover every changelog
+      # version, every tagged release must have a changelog section, and the
+      # recommended version must be one that exists.
+      # The preprocessed-head flag is the fix for neck seams and black faces on
+      # ordinary characters, and clearing it globally is the fix for a head that has
+      # no baked mesh on disk - such as a custom race's, or any remote player's.
+      # Both directions have been shipped by mistake, so the scope is checked:
+      # cleared only for actors whose appearance arrived over the wire, from a saved
+      # value, before the engine builds their body.
+      - name: Verify the preprocessed-head flag stays scoped
+        shell: pwsh
+        run: python Tools/Scripts/check_facegen_scope.py
 
       # CODE_GUIDELINES.md makes documentation part of every version change.
       # This is what enforces it: the coverage figures in prose must match the
