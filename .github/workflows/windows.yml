@@ -103,7 +103,7 @@ jobs:
           path: |
             ${{ github.workspace }}/.vcpkg/downloads
             ${{ github.workspace }}/.vcpkg-cache/binary
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('plugins/*/vcpkg.json', 'plugins/*/vcpkg-configuration.json') }}
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('plugins/**/vcpkg.json', 'plugins/**/vcpkg-configuration.json') }}
           restore-keys: |
             ${{ runner.os }}-vcpkg-
 
@@ -144,7 +144,15 @@ jobs:
           # fetched by vcpkg itself.
           if (Test-Path (Join-Path $vcpkg '.git')) {
             $baselines = @()
-            foreach ($manifest in Get-ChildItem 'plugins/*/vcpkg.json' -ErrorAction SilentlyContinue) {
+            # Recursive on purpose. A plugin's vcpkg project is not always at
+            # plugins/<id>/vcpkg.json: OStimNG's is at plugins/OStimNG/skse/,
+            # beside its CMakeLists.txt. Searching one level deep missed it, so
+            # its pinned baseline was never fetched and the configure died with
+            # 'failed to `git show` versions/baseline.json' - the same
+            # "assume the layout" mistake as the is_checked_out() one, in a
+            # different tool. The overlay ports under cmake/ports/ have no
+            # builtin-baseline, so the guard below skips them.
+            foreach ($manifest in Get-ChildItem -Path 'plugins' -Recurse -Filter 'vcpkg.json' -File -ErrorAction SilentlyContinue) {
               $pinned = (Get-Content -LiteralPath $manifest.FullName -Raw | ConvertFrom-Json).PSObject.Properties['builtin-baseline']
               if ($pinned -and $pinned.Value) { $baselines += $pinned.Value }
             }
@@ -221,22 +229,78 @@ jobs:
           }
           if (-not $env:VCPKG_ROOT) { throw 'VCPKG_ROOT is not set; the vcpkg setup step did not run' }
 
-          # OStimNG reads this variable and fails configure without it. The
-          # submodule checkout above is --recursive, so OStimNG's own pinned
-          # CommonLibSSE-NG is already on disk; use it rather than a second
-          # clone, so the prerequisite builds against the revision it pins.
+          # OStimNG's CMakeLists asserts COMMONLIB_SSE_FOLDER and then add_subdirectory()s
+          # it, so this needs a CommonLibSSE-NG SOURCE checkout - not the vcpkg package the
+          # companion plugins link. It used to be OStimNG's own
+          # skse/extern/CommonLibSSE-NG gitlink, which the recursive checkout above
+          # supplied. OStimNG commit f20db82 ("updated compiler") deleted that gitlink
+          # when OStimNG moved to vcpkg, so the path no longer exists in the pinned tree
+          # and this step could never configure. The revision is pinned in
+          # Code/plugins/plugins.json instead, beside the OStimNG pin it has to match.
+          $manifest = Get-Content Code/plugins/plugins.json -Raw | ConvertFrom-Json
+          $prerequisite = $manifest.prerequisites | Where-Object { $_.id -eq 'OStimNG' }
+          if (-not $prerequisite) { throw 'Code/plugins/plugins.json no longer declares the OStimNG prerequisite' }
+          $commonlibPin = $prerequisite.commonLibSseNg
+          if (-not $commonlibPin -or -not $commonlibPin.commit -or -not $commonlibPin.repository) {
+            throw 'the OStimNG prerequisite declares no commonLibSseNg commit/repository to build against'
+          }
+
           $commonlib = 'plugins/OStimNG/skse/extern/CommonLibSSE-NG'
           if (-not (Test-Path (Join-Path $commonlib 'CMakeLists.txt'))) {
-            throw "OStimNG's pinned CommonLibSSE-NG is missing at $commonlib; the recursive submodule checkout did not populate it"
+            Write-Host "fetching CommonLibSSE-NG $($commonlibPin.commit.Substring(0, 12)) from $($commonlibPin.repository)"
+            New-Item -ItemType Directory -Force -Path $commonlib | Out-Null
+            git -C $commonlib init --quiet
+            git -C $commonlib remote add origin $commonlibPin.repository
+            git -C $commonlib fetch --depth 1 --quiet origin $commonlibPin.commit
+            if ($LASTEXITCODE -ne 0) { throw "failed to fetch the pinned CommonLibSSE-NG commit $($commonlibPin.commit)" }
+            git -C $commonlib checkout --quiet --detach FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'failed to check out the pinned CommonLibSSE-NG commit' }
+            # The tree has its own extern/openvr submodule. Its CMakeLists puts
+            # extern/openvr/headers on the include path and links
+            # extern/openvr/lib/win64/openvr_api.lib whenever VR support is enabled, and
+            # OStimNG forces all three runtimes on, so an unpopulated submodule fails the
+            # build at link time rather than at configure.
+            #
+            # Fetched through the gitlink rather than with `submodule update`:
+            # this checkout was created by `git init` plus a single-commit fetch,
+            # so there is no recorded submodule URL for update to resolve - it
+            # fails with 'no url found for submodule path'. Reading the pinned sha
+            # and the URL out of the tree itself is the same information, without
+            # depending on how the superproject was cloned.
+            $openvr = Join-Path $commonlib 'extern/openvr'
+            if (-not (Test-Path (Join-Path $openvr 'headers/openvr.h'))) {
+              $openvrSha = ((git -C $commonlib ls-tree HEAD extern/openvr) -split '\s+')[2]
+              $openvrUrl = (git -C $commonlib config --file .gitmodules --get submodule.openvr.url)
+              if (-not $openvrSha -or -not $openvrUrl) {
+                throw 'CommonLibSSE-NG no longer pins an extern/openvr submodule this step can resolve'
+              }
+              Write-Host "fetching openvr $($openvrSha.Substring(0, 12)) from $openvrUrl"
+              New-Item -ItemType Directory -Force -Path $openvr | Out-Null
+              git -C $openvr init --quiet
+              git -C $openvr remote add origin $openvrUrl
+              git -C $openvr fetch --depth 1 --quiet origin $openvrSha
+              if ($LASTEXITCODE -ne 0) { throw "failed to fetch openvr $openvrSha" }
+              git -C $openvr checkout --quiet --detach FETCH_HEAD
+              if ($LASTEXITCODE -ne 0) { throw 'failed to check out the pinned openvr commit' }
+            }
+            if (-not (Test-Path (Join-Path $openvr 'headers/openvr.h'))) {
+              throw "openvr headers are missing at $openvr; the link would fail on openvr_api.lib"
+            }
+          }
+          if (-not (Test-Path (Join-Path $commonlib 'CMakeLists.txt'))) {
+            throw "CommonLibSSE-NG is missing at $commonlib after the fetch"
           }
           $env:COMMONLIB_SSE_FOLDER = (Resolve-Path $commonlib).Path
-          Write-Host "COMMONLIB_SSE_FOLDER=$env:COMMONLIB_SSE_FOLDER
           Write-Host "COMMONLIB_SSE_FOLDER=$env:COMMONLIB_SSE_FOLDER"
 
-          $toolchain = Join-Path $env:VCPKG_ROOT 'scripts/buildsystems/vcpkg.cmake'
-          if (-not (Test-Path -LiteralPath $toolchain)) { throw "vcpkg toolchain not found at $toolchain" }
-
-          $configureLog = & cmake -S plugins/OStimNG/skse -B plugins/OStimNG/build -A x64 "-DCMAKE_TOOLCHAIN_FILE=$toolchain" 2>&1
+          # Configured through OStimNG's own preset, not with a hand-written -A/-D line.
+          # The preset is what supplies the Ninja generator, the x64-windows-static
+          # triplet, the static CRT the plugin is built with, and - critically -
+          # VCPKG_OVERLAY_PORTS pointing at OStimNG's cmake/ports/, which is where its
+          # clib-util dependency comes from. That port does not exist in upstream vcpkg,
+          # so a configure without the overlay cannot resolve the manifest at all.
+          $source = 'plugins/OStimNG/skse'
+          $configureLog = & cmake -S $source --preset release 2>&1
           $configureCode = $LASTEXITCODE
           $configureLog | ForEach-Object { Write-Host $_ }
           if ($configureCode -ne 0) {
@@ -247,7 +311,14 @@ jobs:
             throw 'OStimNG configure failed'
           }
 
-          $buildLog = & cmake --build plugins/OStimNG/build --config Release --parallel 2>&1
+          # The preset's binaryDir is ${sourceDir}/build/${presetName}, resolved against
+          # the source directory - so the tree to build is skse/build/release, not the
+          # plugins/OStimNG/build a -B argument would have produced.
+          $binaryDir = Join-Path $source 'build/release'
+          if (-not (Test-Path (Join-Path $binaryDir 'CMakeCache.txt'))) {
+            throw "the preset did not produce a build tree at $binaryDir"
+          }
+          $buildLog = & cmake --build $binaryDir --parallel 2>&1
           $buildCode = $LASTEXITCODE
           $buildLog | ForEach-Object { Write-Host $_ }
           if ($buildCode -ne 0) {

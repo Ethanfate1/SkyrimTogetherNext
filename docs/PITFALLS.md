@@ -3933,3 +3933,146 @@ pActor = Actor::Create(pNpc);
 | `plugin_snapshot.py`(`snapshotScope`) | 把 256 MB 资源写进历史 | `verify` 认 8 个子模块 |
 | `plugin_patches.py`(含 prerequisites) | 前置的补丁不被应用 | 7 个补丁全 verify |
 
+## 40. 2026-09-27 场次:三条流水线全红,而本地 13 个门禁全绿
+
+v1.1.6 打 tag 后 `Build windows` / `Release build` / `Playable Skyrim Together Build`
+三条都死在 `Build the OStimNG prerequisite`,`Plugin gates` 死在
+`Verify the plugin source snapshots`。**四个失败,两处根因,本地一个都复现不了** ——
+这就是本节的主题:门禁量的是不是它以为自己量的东西。
+
+### 40.1 一处笔误红三条:PowerShell 先解析整块,再执行
+
+```powershell
+Write-Host "COMMONLIB_SSE_FOLDER=$env:COMMONLIB_SSE_FOLDER      ← 没有收尾引号
+Write-Host "COMMONLIB_SSE_FOLDER=$env:COMMONLIB_SSE_FOLDER"     ← 完整的那一行在下一行
+```
+
+PowerShell **不是逐行解析**的:它先把整个脚本解析成 AST,再执行。一个未闭合的字符串
+让**整块**语法失败,于是这一步在跑任何命令之前就退出 1 —— 日志里连一行 `cmake`
+输出都没有,annotation 只有 `Process completed with exit code 1.`。
+
+而 `windows.yml` 是被 `release.yml` 与 `windows-playable-build.yml` 通过 `uses:` 复用的
+reusable workflow,**同一段 `run:` 被三条流水线共用**,所以一处笔误三条全红。
+
+> **教训**:`run:` 块里的 PowerShell 是**只在 runner 上才存在**的代码。本地没有任何门禁
+> 读 `.github/workflows/`,于是它能带着一个语法错误一路通过 review、通过 tag、
+> 直到把三条流水线一起打红。
+
+**修法**:新增 `check_workflow_shell.py`,用 PowerShell 自己的解析器
+(`[Parser]::ParseInput`)校验 `.github/workflows/` 里**全部 35 个 pwsh 块**。
+GitHub 会在 PowerShell 看到块之前替换 `${{ ... }}`,而那不是合法 PowerShell,所以先替换成
+字面量再解析 —— 否则会误报 4 个块。**反向验证**:把那个收尾引号删掉,门禁精确报出
+文件、步骤名与行号并 exit 1。
+
+### 40.2 断言了一条**在钉住的提交里已经被删掉**的路径
+
+```powershell
+$commonlib = 'plugins/OStimNG/skse/extern/CommonLibSSE-NG'
+if (-not (Test-Path (Join-Path $commonlib 'CMakeLists.txt'))) { throw ... }
+```
+
+OStimNG 的 `skse/CMakeLists.txt` 第 67 行 `add_subdirectory("$ENV{COMMONLIB_SSE_FOLDER}")`,
+第 68 行 `get_target_property(COMMONLIB_SRC_DIR CommonLibSSE SOURCE_DIR)`,
+第 91 行 `include(${COMMONLIB_SRC_DIR}/cmake/CommonLibSSE.cmake)` —— 它要的是
+**CommonLibSSE-NG 的源码检出**,不是插件链的那份 vcpkg 包(包里没有 `cmake/CommonLibSSE.cmake`, 
+而且 `SOURCE_DIR` 是构建树属性)。
+
+这条路径过去由 OStimNG 自己的 gitlink 提供,而 `f20db82`("updated compiler",
+OStimNG 转向 vcpkg 的那一次)**删掉了 `skse/extern/CommonLibSSE-NG`**。
+我们钉的 `3954683b` 在它之后 —— 于是这条断言在钉住的树里**必然抛**。
+
+**修法**:把修订钉在 `Code/plugins/plugins.json` 的 `commonLibSseNg`,紧挨着它必须匹配的
+OStimNG pin,由 CI 读取并 `fetch`。选 `v8.1.0`(`3c0f5a87`)有据:OStimNG 的 `126fc52` 标题就是
+"fixed build configs, skseapi definition and trampoline for **commonlib 8.1.0**";
+钉住的源码用到 `SKSE_EXPORT`、`GetTrampoline`、`SkyrimVM::GetVMRuntimeData()`、
+`MessageBoxMenu::QueueMessage`、`RE::GFxValue`、`RE::GPtr` —— 逐个在 `v8.1.0` 的
+`SKSE/Interfaces.h`、`SKSE/Trampoline.h`、`RE/S/SkyrimVM.h`、`RE/M/MessageBoxMenu.h` 里核对过。
+
+### 40.3 同一步里另外四个**也会**让它失败的配置错误
+
+修好上面两处之后这一步仍然构建不了 —— 它们是独立的四处:
+
+| 原来 | 为什么不行 | 现在 |
+| --- | --- | --- |
+| `cmake -S ... -B plugins/OStimNG/build -A x64` | 手写 `-A` 生成 VS 工程,而 OStimNG 的预设用 **Ninja**;`-A` 与预设不能共存 | `cmake -S plugins/OStimNG/skse --preset release` |
+| 同上 | 没有 `VCPKG_OVERLAY_PORTS`。OStimNG 依赖 `clib-util`,而它在**上游 vcpkg 里不存在**(pinned baseline 与 master 的 `ports/clib-util/vcpkg.json` 都是 404),只有 `skse/cmake/ports/` 那份 overlay 有 | 预设自带 `${sourceDir}/cmake/ports/` |
+| 构建 `plugins/OStimNG/build` | 预设的 `binaryDir` 是 `${sourceDir}/build/${presetName}`,实际产物在 `skse/build/release` | 构建前断言 `CMakeCache.txt` 就在那棵树里 |
+| `Get-ChildItem 'plugins/*/vcpkg.json'` | **只找一层**。OStimNG 的 manifest 在 `plugins/OStimNG/skse/`,于是它 pin 的 `e3ed4186` 从不被 fetch;而 vcpkg 解析 `builtin-baseline` 只跑 `git show <sha>:versions/baseline.json`、**没有 fetch 回退**,在 `--depth 1` 的 vcpkg 里必然 `failed to \`git show\` versions/baseline.json`(§29.5 记的正是这个错) | 改为 `Get-ChildItem -Path 'plugins' -Recurse -Filter 'vcpkg.json'`;overlay ports 没有 `builtin-baseline`,被 `if ($pinned -and $pinned.Value)` 跳过 |
+
+最后一条**和 §39.5 是同一个形状**:"子模块的项目在哪"又一次被假设成了一层深。
+§29.5 当时把"从 manifest 反推 baseline"设计成抗重钉的,但反推本身**只找一层**,
+于是 OStimNG 一来它就漏了 —— 抗住了"值会变",没抗住"位置会变"。
+
+另外补上 `extern/openvr`:CommonLibSSE-NG 在 `ENABLE_SKYRIM_VR` 打开时把
+`extern/openvr/headers` 加进包含路径、并链接 `extern/openvr/lib/win64/openvr_api.lib`,
+而 OStimNG 第 62–64 行强制打开 SE/AE/VR 三个运行时。它是 CommonLibSSE-NG 自己的子模块。
+
+**不能用 `submodule update`**:上面那个检出是 `git init` 加一次单提交 `fetch` 出来的,
+没有记录子模块 URL,`update` 会以 `no url found for submodule path` 失败。改为从树本身读
+出 gitlink sha(`git ls-tree HEAD extern/openvr`)和 URL(`.gitmodules` 的
+`submodule.openvr.url`)再直接 `fetch` —— 同样的信息,但不依赖上层仓库是怎么克隆的。
+
+> **教训**:预设不是"另一种写法",它是**构建输入的一部分**。手写 `-A x64` 看起来等价,
+> 实际丢掉了生成器、triplet、静态 CRT 与 overlay ports 四样东西。
+
+### 40.4 备份少了一个文件:嵌套 `.gitignore` 优先于根目录的否定规则
+
+```text
+snapshots/plugins/OStimNG/.gitignore:553:gfxfontlib.swf
+```
+
+快照**原样保留插件的 `.gitignore`**(它本身是被备份的源码,且门禁要求它与钉住提交逐字节一致),
+而嵌套 `.gitignore` **优先于**根目录 `.gitignore` 里的 `!/snapshots/**`。于是
+`gfxfontlib.swf`(111 KB,在 `flash/` 下)**在本地存在、却从未进过 git**:
+
+```text
+本地  verify → 看工作区 → 文件在 → 绿
+CI    verify → 干净检出 → 文件不在 → 红
+```
+
+**同一个门禁在两台机器上量的是两件事**,而这一整类问题都是同一个形状。
+
+**修法**:`snapshot` 用 `git add --force` 暂存 —— 这是 git 里**唯一**能无视 ignore 规则的
+机制 —— 并把被覆盖的规则记进 `UPSTREAM.json` 的 `ignoredRulesOverridden`;
+`verify` 改问 **"git 是否记录了这个文件"**(`git ls-files`)而不是"磁盘上有没有"。
+
+> **教训**:一个备份目录里,"文件在磁盘上"**不是**正确的不变量。备份的定义是
+> "它在别人的 clone 里也在",所以唯一该问的是 git 记录了什么。
+
+**反向验证**:① 把文件从索引里移除、留在磁盘上(原始 bug)→ 新门禁 exit 1 并指名文件;
+② 把文件从磁盘删掉(CI 现象)→ 旧检查也会 exit 1;③ 恢复后两者都绿。
+
+### 40.5 顺带修掉三处同类问题
+
+- `plugin_snapshot.py update` 仍在用"根目录有没有 `CMakeLists.txt`"判断子模块是否检出,
+  于是 OStimNG 每次都被静默跳过(`not checked out, skipped`)—— 而这正是重钉时必须覆盖的
+  那一个前置。§39.5 说"统一为 `is_checked_out()`",但当时**只改了 `snapshot` 与 `verify`**,
+  第三个调用点漏了。这是同一个教训的第二次出现:**同一件事有两个写法,就有一处会漏**。
+- `UPSTREAM.json` 的 `upstream` 读 `.git/config`(`submodule.<name>.url`),而该条目**只在
+  子模块初始化后**才存在,于是 OStimNG 那份记成了空字符串。改读 `.gitmodules` —— 受版本
+  控制的普通内容,在任何 clone 里都一样。
+- `snapshot` 每次重写 8 份 `UPSTREAM.json`,把 `ignoredRulesOverridden` 写成空数组,
+  产生 8 份无意义 diff。改为只在非空时写入。
+
+### 40.6 本轮新增的门禁与反向验证
+
+| 门禁 | 拦什么 | 反向验证 |
+| --- | --- | --- |
+| `check_workflow_shell.py` | `.github/workflows/` 里任何 pwsh 块语法不通过 | 删掉收尾引号 → 精确到文件/步骤/行号,exit 1 |
+| `check_ostimng_build.py` | 清单没钉 CommonLibSSE-NG,或 CI 步骤不再读它 | 删 pin / 换成 tag / 改字段名 → 三种都 exit 1 |
+| `plugin_snapshot.py`(verify) | 快照文件在磁盘上但**未被 git 记录** | 从索引移除 → exit 1 |
+
+### 40.7 这一轮真正的教训
+
+四个失败,本地 13 个门禁**全部通过**。两处根因都属于同一类:
+**门禁量的东西和它以为自己量的东西不是同一个**。
+
+| 门禁 | 以为在量 | 实际在量 |
+| --- | --- | --- |
+| 本地"跑一遍 CI 的步骤" | 那段 PowerShell 能跑 | 它**能不能被解析**(没人解析过它) |
+| `plugin_snapshot.py verify` | 备份里有这些文件 | **工作区**里有这些文件 |
+| (不存在) | OStimNG 能被构建 | 断言的那条路径**是不是真的存在** |
+
+所以补的不只是两个修复,而是两个门禁:一个**解析**工作流里的脚本,
+一个**绑定**清单与 CI 步骤。它们各自对应上表的一行。
+

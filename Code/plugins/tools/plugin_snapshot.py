@@ -109,6 +109,97 @@ def in_scope(plugin: dict, rel: str) -> bool:
     return any(rel == prefix or rel.startswith(prefix.rstrip('/') + '/') for prefix in scope)
 
 
+def snapshot_path(plugin_id: str) -> str:
+    return f'{SNAPSHOT_DIR}/{plugin_id}'
+
+
+def upstream_url(plugin_id: str) -> str:
+    """The submodule's URL from .gitmodules, not from .git/config.
+
+    .git/config only holds an entry once the submodule has been initialised,
+    which is why reading it there recorded an empty upstream for OStimNG - the
+    one entry whose submodule had not been synced on the machine that generated
+    the snapshot. .gitmodules is tracked content, so it says the same thing in
+    every clone.
+    """
+    section = f'submodule.plugins/{plugin_id}'
+    out = run(['git', 'config', '--file', '.gitmodules', '--get', f'{section}.url'], check=False).strip()
+    if out:
+        return out
+    return run(['git', 'config', '--get', f'{section}.url'], check=False).strip()
+
+
+def tracked_files(plugin_id: str) -> set[str]:
+    """The snapshot files git actually records, relative to the snapshot root.
+
+    The working tree is not the backup. A file that exists on disk but is not
+    tracked is absent from every clone and from the repository's history, which
+    is the only thing this directory exists to provide - so 'is it on disk' is
+    the wrong question and 'is it committed' is the right one.
+    """
+    prefix = snapshot_path(plugin_id) + '/'
+    out = run(['git', 'ls-files', '--', snapshot_path(plugin_id)], check=False)
+    return {line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)}
+
+
+def snapshot_files(plugin_id: str) -> list[str]:
+    """Every file currently in the snapshot, repo-relative, POSIX separators."""
+    root = ROOT / snapshot_path(plugin_id)
+    if not root.is_dir():
+        return []
+    return sorted(p.relative_to(ROOT).as_posix() for p in root.rglob('*') if p.is_file())
+
+
+def ignored_files(plugin_id: str) -> list[str]:
+    """Snapshot files a vendored .gitignore excludes, with the rule that does it.
+
+    Asked with --no-index on purpose. Without it, git reports nothing for a file
+    that is already tracked, so the answer changed depending on whether the
+    force-add had run yet - and 'snapshot' then wrote a different record every
+    time it was re-run. --no-index evaluates the rules themselves, so the result
+    is a property of the tree and not of the index.
+
+    The stdin payload is encoded here rather than passed as text: check-ignore
+    reads paths one per line, and text mode would translate the line endings and
+    make every path miss.
+    """
+    files = [f for f in snapshot_files(plugin_id) if not f.endswith('/' + UPSTREAM_FILE)]
+    if not files:
+        return []
+    result = subprocess.run(
+        ['git', 'check-ignore', '--no-index', '-v', '--stdin'],
+        cwd=str(ROOT), input='\n'.join(files).encode('utf-8'), capture_output=True,
+    )
+    ignored: list[str] = []
+    for line in result.stdout.decode('utf-8', 'replace').splitlines():
+        if not line.strip():
+            continue
+        rule, _, path = line.partition('\t')
+        # '<source>:<lineno>:<pattern>'; a pattern starting with '!' is a
+        # negation, which means the file is NOT ignored by the last match.
+        pattern = rule.rsplit(':', 1)[-1]
+        if pattern.startswith('!'):
+            continue
+        ignored.append(f'{path.strip()}  ({rule})')
+    return ignored
+
+
+def stage_snapshot(plugin_id: str) -> None:
+    """Force-add a snapshot, so a vendored ignore file cannot exclude it.
+
+    A snapshot keeps the plugin's own .gitignore, because that file is part of
+    the source and the gate below requires it to stay byte-identical to the
+    pinned commit. It cannot therefore be edited to un-ignore something, and a
+    nested ignore file takes precedence over the root .gitignore's
+    '!/snapshots/**' negation. That is exactly how OStimNG's 'gfxfontlib.swf'
+    rule held one file out of the backup while the file sat on disk looking
+    present: the local check passed and the CI gate, on a fresh clone, reported
+    it missing. `git add --force` is the only mechanism that ignores ignore
+    rules, so the invariant is established here rather than trusted.
+    """
+    run(['git', 'add', '--force', '--', snapshot_path(plugin_id)])
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -175,16 +266,29 @@ def snapshot_one(plugin: dict) -> dict:
         digest.update(b'\0')
         copied += 1
 
-    url = run(['git', 'config', '--get', f'submodule.plugins/{plugin_id}.url'], check=False).strip()
+    # The snapshot keeps the plugin's own .gitignore, so a rule inside it can
+    # name a file this backup is supposed to hold. What had to be overridden is
+    # read here, recorded below, and then forced into the index by the staging
+    # call at the end - after the record is written, so the record is staged too.
+    overridden = ignored_files(plugin_id)
+
     record = {
         'id': plugin_id,
-        'upstream': url,
+        'upstream': upstream_url(plugin_id),
         'commit': pinned_sha(plugin_id),
         'files': copied,
         'contentSha256': digest.hexdigest(),
         'why': 'Durability copy of the pinned commit. Not a build input: the submodule builds. Kept so the code survives the upstream repository disappearing.',
     }
+    # Recorded only when it is not empty, so refreshing the snapshots does not
+    # rewrite eight records to say nothing happened.
+    if overridden:
+        record['ignoredRulesOverridden'] = overridden
     (target / UPSTREAM_FILE).write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
+
+    # Last, so the record written above is staged as well: a snapshot whose
+    # record is untracked is a snapshot a fresh clone cannot check.
+    stage_snapshot(plugin_id)
     return record
 
 
@@ -192,6 +296,10 @@ def cmd_snapshot(_args) -> int:
     for plugin in plugins():
         record = snapshot_one(plugin)
         print(f"  {record['id']:<24} {record['files']:>4} files  {record['commit'][:8] if record['commit'] else '?'}  {record['contentSha256'][:12]}")
+        for line in record.get('ignoredRulesOverridden', []):
+            print(f'      forced past an ignore rule: {line.strip()}')
+        if record.get('ignoredRulesOverridden'):
+            print('      ^ these files are now tracked; a vendored .gitignore had excluded them')
     print()
     print('snapshot refreshed; commit snapshots/ together with any submodule re-pin')
     return 0
@@ -224,6 +332,23 @@ def cmd_verify(_args) -> int:
         if not is_checked_out(plugin):
             failures.append(f"{plugin_id}: submodule not checked out, cannot confirm the snapshot is current")
             continue
+
+        # A file present on disk but absent from git is not in the backup: it
+        # is not in any clone and not in the history, which is the whole point
+        # of this directory. Checking the working tree instead of the index is
+        # what let a vendored .gitignore hold one file out of the OStimNG
+        # snapshot while this gate passed locally and failed in CI, where the
+        # checkout only has what git recorded.
+        tracked = tracked_files(plugin_id)
+        untracked = sorted(r for r in (target.rglob('*'))
+                           if r.is_file() and r.name != UPSTREAM_FILE
+                           and r.relative_to(target).as_posix() not in tracked)
+        if untracked:
+            failures.append(
+                f"{plugin_id}: {len(untracked)} snapshot file(s) are on disk but not tracked by git, "
+                f"so no clone receives them, e.g. {untracked[0]}; an ignore rule is "
+                f"excluding them - re-run 'snapshot', which stages with --force"
+            )
 
         digest = hashlib.sha256()
         missing: list[str] = []
@@ -271,8 +396,13 @@ def cmd_update(args) -> int:
     """Report what upstream changed since the pinned commit."""
     for plugin in plugins():
         plugin_id = plugin['id']
-        submodule = ROOT / 'plugins' / plugin_id
-        if not (submodule / 'CMakeLists.txt').exists():
+        submodule = ROOT / plugin['submodule']
+        # The same check the other commands use. A root CMakeLists.txt is not
+        # where every plugin's project lives - OStimNG's is at skse/CMakeLists.txt
+        # - so testing for it here reported OStimNG as 'not checked out' and
+        # skipped it silently, which is the one prerequisite a re-pin has to
+        # cover. "Is the submodule checked out" must have one answer.
+        if not is_checked_out(plugin):
             print(f'  {plugin_id}: not checked out, skipped')
             continue
 

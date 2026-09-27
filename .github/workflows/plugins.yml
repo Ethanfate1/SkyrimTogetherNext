@@ -165,6 +165,29 @@ jobs:
         shell: pwsh
         run: python Code/plugins/tools/check_ostimng_versions.py
 
+      # The OStimNG build needs a CommonLibSSE-NG SOURCE checkout, and the pinned
+      # OStimNG no longer carries one: commit f20db82 deleted its
+      # skse/extern/CommonLibSSE-NG gitlink when OStimNG moved to vcpkg, so the
+      # path the CI step asserted on stopped existing and three workflows failed
+      # before configuring. The revision is pinned in Code/plugins/plugins.json
+      # now, and this binds the two together - the manifest must declare it and
+      # the step must read it, or the build silently goes back to a hard-coded
+      # path that only CI can disprove.
+      - name: Verify the OStimNG build inputs are pinned
+        shell: pwsh
+        run: python Code/plugins/tools/check_ostimng_build.py
+
+      # A workflow's run: block only ever executes on a runner, so a syntax error
+      # in one is invisible until the job starts - and a job that cannot start
+      # reports nothing useful. The OStimNG prerequisite step shipped with an
+      # unterminated string literal, so PowerShell refused to parse the whole
+      # block, the step exited before running a command, and three workflows
+      # failed with no CMake output to explain why. Every other gate passed,
+      # because none of them read the workflow files.
+      - name: Verify every PowerShell workflow block parses
+        shell: pwsh
+        run: python Code/plugins/tools/check_workflow_shell.py
+
       # CODE_GUIDELINES.md makes documentation part of every version change.
       # This is what enforces it: the coverage figures in prose must match the
       # generator, both README version tables must cover every changelog

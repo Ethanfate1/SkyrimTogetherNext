@@ -7,6 +7,102 @@
 每个 tag(形如 `v1.0.20`)对应一个 Release,附上版本号相同的两个包——
 客户端 mod 与专用服务器。逐条提交的历史见 `git log` 与各次 PR。
 
+## v1.1.7(2026-09-27)
+
+### 修复:v1.1.6 的远程仓库编译全红 —— 三处「只有 CI 才会说的话」
+
+**现象**:`v1.1.6` 打 tag 后,四条流水线全挂 —— `Build windows`、`Release build`、
+`Playable Skyrim Together Build` 三个都死在同一步 `Build the OStimNG prerequisite`,
+`Plugin gates` 死在 `Verify the plugin source snapshots`。而**本地 13 个门禁全绿**,
+因为这两处失败都发生在本地看不⻅的地方。
+
+#### A. 那一步的 PowerShell 根本没被解析
+
+```text
+Write-Host "COMMONLIB_SSE_FOLDER=$env:COMMONLIB_SSE_FOLDER      ← 少一个收尾引号
+Write-Host "COMMONLIB_SSE_FOLDER=$env:COMMONLIB_SSE_FOLDER"     ← 下一行是完整的重复
+```
+
+PowerShell 对**整段 `run:` 块**先解析再执行,一个未闭合的字符串会让整块**语法失败**,
+于是这一步在任何命令执行前就退出 1,日志里连一行 CMake 输出都没有。三条流水线
+共用同一段 `run:`(windows.yml 是被 `release.yml` 与 `windows-playable-build.yml`
+复用的 reusable workflow),所以**一处笔误红三条**。
+
+#### B. 那一步依赖的路径,在钉住的那个提交里已经被删掉了
+
+```text
+$commonlib = 'plugins/OStimNG/skse/extern/CommonLibSSE-NG'
+if (-not (Test-Path (Join-Path $commonlib 'CMakeLists.txt'))) { throw ... }
+```
+
+OStimNG 的 `skse/CMakeLists.txt` 会断言 `COMMONLIB_SSE_FOLDER` 并 `add_subdirectory()`
+它,所以构建 OStimNG **需要 CommonLibSSE-NG 的源码检出**,而不是插件链的那份 vcpkg 包。
+这条路径过去由 OStimNG 自己的 `skse/extern/CommonLibSSE-NG` gitlink 提供 —— 而
+`f20db82`("updated compiler",OStimNG 转向 vcpkg 的那一次)**删掉了这个 gitlink**。
+我们钉的 `3954683b` 在它之后,于是路径在钉住的树里**不存在**,断言必然抛。
+
+**修法**:把修订钉在 `Code/plugins/plugins.json` 的 `commonLibSseNg` 里,紧挨着它必须匹配的
+OStimNG pin,由 CI 读取并 `fetch`。选 `v8.1.0`(`3c0f5a87`)不是随手挑的:
+OStimNG 自己的 `126fc52` 就是"fixed build configs, skseapi definition and trampoline for
+**commonlib 8.1.0**",而钉住的源码用到 `SKSE_EXPORT`、`GetTrampoline`、
+`SkyrimVM::GetVMRuntimeData()`、`MessageBoxMenu::QueueMessage` —— 逐个在 `v8.1.0` 里核对过。
+
+同一处还修掉三个**本来也会让这一步失败**的配置错误:
+
+| 原来 | 问题 | 现在 |
+| --- | --- | --- |
+| `cmake -S ... -B plugins/OStimNG/build -A x64` | 手写的 `-A` 覆盖不了预设:OStimNG 用 **Ninja** 生成器 | `cmake -S plugins/OStimNG/skse --preset release` |
+| 同上 | 没有 `VCPKG_OVERLAY_PORTS`,而 OStimNG 的 `clib-util` **不在上游 vcpkg**(baseline 与 master 都 404),manifest 解析不了 | 预设自带 `${sourceDir}/cmake/ports/` |
+| 构建 `plugins/OStimNG/build` | 预设的 `binaryDir` 是 `${sourceDir}/build/${presetName}`,实际产物在 `skse/build/release` | 构建前断言 `CMakeCache.txt` 在正确的树里 |
+| `Get-ChildItem 'plugins/*/vcpkg.json'` | **只找一层**,而 OStimNG 的 manifest 在 `plugins/OStimNG/skse/`,于是它 pin 的 `e3ed4186` 从不被 fetch,而 vcpkg 的 `builtin-baseline` 只跑 `git show`、没有回退 ⇒ 在 `--depth 1` 的 vcpkg 里必然 `failed to \`git show\` versions/baseline.json` | 改为 `-Recurse -Filter 'vcpkg.json'`(overlay ports 没有 `builtin-baseline`,会被守卫跳过) |
+
+另外补上 `extern/openvr`:CommonLibSSE-NG 在 `ENABLE_SKYRIM_VR` 打开时会把
+`extern/openvr/headers` 加进包含路径并链接 `lib/win64/openvr_api.lib`,而 OStimNG
+强制打开三个运行时。它是 CommonLibSSE-NG 自己的子模块,用**它钉住的 gitlink sha** 直接
+`fetch`(`submodule update` 在这个 `git init` + 单提交 `fetch` 出来的检出里解析不出 URL,
+会报 `no url found for submodule path`)。
+
+#### C. 备份里少了一个文件,因为插件自己的 .gitignore 说了算
+
+```text
+snapshots/plugins/OStimNG/.gitignore:553:gfxfontlib.swf
+```
+
+快照**原样保留插件的 `.gitignore`**(它本身是被备份的源码,且门禁要求它与钉住提交逐字节一致),
+而嵌套的 `.gitignore` **优先于**根目录 `.gitignore` 里的 `!/snapshots/**` 否定规则。
+于是 `gfxfontlib.swf`(111 KB,在 `flash/` 下)**在本地存在、却从未进过 git**。
+本地的 `verify` 看的是工作区,于是绿;CI 是干净检出,文件不在,于是红 ——
+**同一个门禁在两台机器上量的是两件事**。
+
+**修法**:`snapshot` 用 `git add --force` 暂存(这是唯一能无视 ignore 规则的机制),
+并把被覆盖的规则打进 `UPSTREAM.json` 的 `ignoredRulesOverridden`;`verify` 改问
+**"git 是否记录了这个文件"**而不是"磁盘上有没有"。
+
+### 新增两个门禁(各反向验证过)
+
+| 门禁 | 拦什么 | 反向验证 |
+| --- | --- | --- |
+| `check_workflow_shell.py` | `.github/workflows/` 里任何 pwsh 块**语法不通过** | 把那个收尾引号删掉 → 精确指出文件、步骤、行号,exit 1 |
+| `check_ostimng_build.py` | 清单没钉 CommonLibSSE-NG,或 CI 步骤不再读它 | 删 pin / 换成 tag / 改掉字段名 → 三种都 exit 1 |
+
+`check_workflow_shell.py` 用 PowerShell 自己的解析器,覆盖全部 35 个块;
+`${{ ... }}` 先替换成字面量再解析,否则 GitHub 表达式会被当成语法错误误报。
+
+### 顺带修掉三个同类问题
+
+- `plugin_snapshot.py update` 仍在用"根目录有没有 `CMakeLists.txt`"判断子模块是否检出,
+  于是 OStimNG 每次都被静默跳过(`not checked out, skipped`)—— 而这正是重钉时必须覆盖的
+  那一个前置。§39.5 说"统一为 `is_checked_out()`",但当时只改了 `snapshot` 与 `verify`。
+- `UPSTREAM.json` 的 `upstream` 读的是 `.git/config`(只在子模块初始化后才有条目),
+  所以 OStimNG 那份记成了**空字符串**。改读 `.gitmodules`(受版本控制的普通内容)。
+- `snapshot` 每次都会重写 8 份 `UPSTREAM.json`,把 `ignoredRulesOverridden` 写成空数组,
+  产生无意义的 diff。现在只在非空时写入。
+
+### 门禁全绿(13 项)
+
+`strpm_contract`、`plugin_snapshot verify`、`plugin_patches verify`、`papyrus_archive`、
+`check_exports`、`check_transport_compat`、`check_skee_abi`、`check_ostimng_versions`、
+`check_ostimng_build`、`check_workflow_shell`、`check_facegen_scope`、`check_docs`、`merge_fomod check`。
 ## v1.1.6(2026-09-27)
 
 ### 修复:两处「刚进游戏就闪退」—— 一处在我们的运行时,一处在 RaceMenu 接口版本
