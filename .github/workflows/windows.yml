@@ -664,7 +664,11 @@ jobs:
           cp -r Code/skyrim_ui/dist/UI ${{ env.STR_BUILD_DIR }}
 
       - id: output-version
-        run: echo "version=$(git describe --tags)" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+        run: |
+          $version = git describe --tags 2>$null
+          if (-not $version) { $version = "v1.1.7" }
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       # The last step of the job, so it runs after everything else has had a
       # chance to report. This is where a deferred plugin failure lands.
