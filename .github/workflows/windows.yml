@@ -666,9 +666,7 @@ jobs:
       - id: output-version
         shell: pwsh
         run: |
-          $version = git describe --tags 2>$null
-          if (-not $version) { $version = "v1.1.7" }
-          "version=$version" >> $env:GITHUB_OUTPUT
+          "version=v1.1.7" >> $env:GITHUB_OUTPUT
 
       # The last step of the job, so it runs after everything else has had a
       # chance to report. This is where a deferred plugin failure lands.
